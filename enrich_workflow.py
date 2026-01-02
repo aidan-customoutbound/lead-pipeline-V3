@@ -2,7 +2,7 @@
 Automated cold email workflow - Website enrichment script.
 
 This script processes websites from Supabase, enriches them with Exa.AI summaries,
-and categorizes them using OpenAI GPT-4o-mini.
+and categorizes them using OpenRouter LLM models.
 
 Production-ready version with batch processing for large datasets.
 """
@@ -23,21 +23,28 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 EXA_API_KEY = os.getenv("EXA_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 SEMAPHORE_LIMIT = 5  # Max concurrent requests (respects Exa's 10 QPS limit)
 BATCH_SIZE = 50  # Number of rows to fetch and process per batch
+
+# LLM Configuration
+LLM_MODEL_PRIMARY = "google/gemini-2.5-flash"
+LLM_MODEL_FALLBACK = "openai/gpt-5-mini"
+LLM_TEMPERATURE = 0.3
+LLM_MAX_TOKENS = 50
+LLM_PROMPT_TEMPLATE = "In 2 words tell me what kind of company this is based on the description: {exa_summary}"
 
 
 class EnrichmentWorkflow:
     """Handles the enrichment workflow for prospect websites."""
     
     def __init__(self):
-        """Initialize global clients for Supabase, Exa.AI, and OpenAI (reused across all batches)."""
-        if not all([SUPABASE_URL, SUPABASE_KEY, EXA_API_KEY, OPENAI_API_KEY]):
+        """Initialize global clients for Supabase, Exa.AI, and OpenRouter (reused across all batches)."""
+        if not all([SUPABASE_URL, SUPABASE_KEY, EXA_API_KEY, OPENROUTER_API_KEY]):
             raise ValueError(
                 "Missing required environment variables. "
                 "Please check your .env file for: "
-                "SUPABASE_URL, SUPABASE_KEY, EXA_API_KEY, OPENAI_API_KEY"
+                "SUPABASE_URL, SUPABASE_KEY, EXA_API_KEY, OPENROUTER_API_KEY"
             )
         
         # Initialize global Supabase client (reused across all batches)
@@ -46,8 +53,16 @@ class EnrichmentWorkflow:
         # Initialize global Exa.AI client (reused across all batches)
         self.exa = Exa(api_key=EXA_API_KEY)
         
-        # Initialize global OpenAI client (reused across all batches)
-        self.openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        # Initialize global OpenRouter client (reused across all batches)
+        # OpenRouter is OpenAI-compatible, so we use AsyncOpenAI with OpenRouter base URL
+        self.openrouter_client = AsyncOpenAI(
+            api_key=OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={
+                "HTTP-Referer": "https://example.com",
+                "X-Title": "ProspectV2Workflow"
+            }
+        )
     
     def _normalize_website(self, website: str) -> str:
         """
@@ -366,7 +381,8 @@ class EnrichmentWorkflow:
     
     async def get_company_category(self, exa_summary: str) -> Optional[str]:
         """
-        Get 2-word company category from OpenAI GPT-4o-mini based on Exa summary.
+        Get 2-word company category from OpenRouter LLM based on Exa summary.
+        Uses primary model with automatic fallback to secondary model on failure.
         
         Args:
             exa_summary: The company summary from Exa.AI
@@ -374,19 +390,18 @@ class EnrichmentWorkflow:
         Returns:
             2-word category string or None if error occurs
         """
+        # Format prompt using template
+        prompt = LLM_PROMPT_TEMPLATE.format(exa_summary=exa_summary)
+        
+        # Try primary model first
         try:
-            prompt = (
-                f"In 2 words tell me what kind of company this is based on the description: {exa_summary}"
-            )
-            
-            # Call OpenAI using global client
-            response = await self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",
+            response = await self.openrouter_client.chat.completions.create(
+                model=LLM_MODEL_PRIMARY,
                 messages=[
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=10,
-                temperature=0.3
+                max_tokens=LLM_MAX_TOKENS,
+                temperature=LLM_TEMPERATURE
             )
             
             if response and response.choices and len(response.choices) > 0:
@@ -399,12 +414,35 @@ class EnrichmentWorkflow:
             
             return None
         except Exception as e:
-            print(f"Error getting company category from OpenAI: {str(e)}")
-            return None
+            # Primary model failed, try fallback
+            print(f"Primary model failed; retrying with fallback")
+            try:
+                response = await self.openrouter_client.chat.completions.create(
+                    model=LLM_MODEL_FALLBACK,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=LLM_MAX_TOKENS,
+                    temperature=LLM_TEMPERATURE
+                )
+                
+                if response and response.choices and len(response.choices) > 0:
+                    category = response.choices[0].message.content.strip()
+                    # Remove quotes if present
+                    category = category.strip('"\'')
+                    # Take first 2 words
+                    words = category.split()[:2]
+                    return ' '.join(words)
+                
+                return None
+            except Exception as e2:
+                # Fallback also failed
+                print(f"Error getting company category from OpenRouter: {str(e2)}")
+                return None
     
     async def enrich_prospect(self, prospect: Dict[str, Any], semaphore: asyncio.Semaphore) -> None:
         """
-        Enrich a single prospect with Exa summary and OpenAI category.
+        Enrich a single prospect with Exa summary and OpenRouter category.
         
         Args:
             prospect: Dictionary containing prospect data (must have 'id' and 'website' fields)
@@ -428,7 +466,7 @@ class EnrichmentWorkflow:
                     await self._update_prospect_status(prospect_id, 'error', None, None)
                     return
                 
-                # Get company category from OpenAI
+                # Get company category from OpenRouter
                 company_category = await self.get_company_category(exa_summary)
                 
                 if not company_category:
@@ -463,7 +501,7 @@ class EnrichmentWorkflow:
             prospect_id: The ID of the prospect to update
             status: New status ('enriched' or 'error')
             exa_summary: The summary from Exa.AI (can be None)
-            company_category: The category from OpenAI (can be None)
+            company_category: The category from OpenRouter (can be None)
         """
         try:
             update_data = {'status': status}
@@ -536,7 +574,7 @@ class EnrichmentWorkflow:
         print("\n[2/4] Initializing clients...")
         print(f"  ✓ Supabase client initialized")
         print(f"  ✓ Exa.AI client initialized")
-        print(f"  ✓ OpenAI client initialized")
+        print(f"  ✓ OpenRouter client initialized")
         print(f"  ✓ Semaphore limit: {SEMAPHORE_LIMIT} concurrent requests")
         print(f"  ✓ Batch size: {BATCH_SIZE} rows per batch")
         
