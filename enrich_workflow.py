@@ -34,29 +34,29 @@ NUM_STEPS_TO_RUN = 2  # Number of enrichment steps to execute (expandable to 4)
 STEP1_MODEL_PRIMARY = "google/gemini-2.5-flash"
 STEP1_MODEL_FALLBACK = "openai/gpt-5-mini"
 STEP1_TEMPERATURE = 0.3
-STEP1_MAX_TOKENS = 50
+STEP1_MAX_TOKENS = 250
 STEP1_PROMPT_TEMPLATE = "In 2 words tell me what kind of company this is based on the description: {exa_summary}"
 
 # Step 2 Configuration
 STEP2_MODEL_PRIMARY = "google/gemini-2.5-flash"
 STEP2_MODEL_FALLBACK = "openai/gpt-5-mini"
 STEP2_TEMPERATURE = 0.3
-STEP2_MAX_TOKENS = 50
+STEP2_MAX_TOKENS = 250
 STEP2_PROMPT_TEMPLATE = "Given this company description: {exa_summary}. And this prior result: {step1_output}. Provide one sentence expanding on the category."
 
 # Step 3 Configuration (for future expansion)
 STEP3_MODEL_PRIMARY = "google/gemini-2.5-flash"
 STEP3_MODEL_FALLBACK = "openai/gpt-5-mini"
 STEP3_TEMPERATURE = 0.3
-STEP3_MAX_TOKENS = 50
-STEP3_PROMPT_TEMPLATE = "{exa_summary} {step1_output} {step2_output}"
+STEP3_MAX_TOKENS = 250
+STEP3_PROMPT_TEMPLATE = "Is this company B2B or B2C?: {exa_summary}"
 
 # Step 4 Configuration (for future expansion)
 STEP4_MODEL_PRIMARY = "google/gemini-2.5-flash"
 STEP4_MODEL_FALLBACK = "openai/gpt-5-mini"
 STEP4_TEMPERATURE = 0.3
-STEP4_MAX_TOKENS = 50
-STEP4_PROMPT_TEMPLATE = "{exa_summary} {step1_output} {step2_output} {step3_output}"
+STEP4_MAX_TOKENS = 250
+STEP4_PROMPT_TEMPLATE = "Generate a list of this companys services: {exa_summary}"
 
 
 class EnrichmentWorkflow:
