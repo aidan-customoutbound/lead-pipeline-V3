@@ -28,11 +28,11 @@ SEMAPHORE_LIMIT = 5  # Max concurrent requests (respects Exa's 10 QPS limit)
 BATCH_SIZE = 50  # Number of rows to fetch and process per batch
 
 # LLM Configuration
-LLM_MODEL_PRIMARY = "google/gemini-2.5-flash"
+LLM_MODEL_PRIMARY = "google/gemini-2.5-flash-lite-preview-09-2025"
 LLM_MODEL_FALLBACK = "openai/gpt-5-mini"
 LLM_TEMPERATURE = 0.3
-LLM_MAX_TOKENS = 50
-LLM_PROMPT_TEMPLATE = "In 2 words tell me what kind of company this is based on the description: {exa_summary}"
+LLM_MAX_TOKENS = 200
+LLM_PROMPT_TEMPLATE = "Given a company description, I need you to confirm whether or not this company is primarily B2B or B2C. B2B is a company that provides software, services, or products to companies. A B2C company is a company that provides software, services, or products to consumers and not companies. If there is not enough information to generate an accurate answer, you must return an empty string with no words, otherwise you must only return a single sentence explaining your reasoning followed by either  - B2B or  - B2C. Please take your time to generate an accurate answer. Here is the company information: {exa_summary}"
 
 
 class EnrichmentWorkflow:
