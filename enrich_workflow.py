@@ -27,12 +27,36 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 SEMAPHORE_LIMIT = 5  # Max concurrent requests (respects Exa's 10 QPS limit)
 BATCH_SIZE = 50  # Number of rows to fetch and process per batch
 
-# LLM Configuration
-LLM_MODEL_PRIMARY = "google/gemini-2.5-flash-lite-preview-09-2025"
-LLM_MODEL_FALLBACK = "openai/gpt-5-mini"
-LLM_TEMPERATURE = 0.3
-LLM_MAX_TOKENS = 200
-LLM_PROMPT_TEMPLATE = "Given a company description, I want you to generate a comma separated list of this companys services. For example, if given a description of a tree trimming company, you might output tree trimming, stump grinding, free estimates, tree removal services. Here are the formatting rules for your list: 1) You cannot use any special characters like parentheses, 2) Your new list cannot be longer than 100 characters, 3) You must generate at least 3 services, 4) your answer cannot contain capital letters, and 5) your answer should start with: The new list is: . If there is not enough information to generate an accurate list, please return an empty string with no words.  Here is the company description: {exa_summary}"
+# Multi-step AI Enrichment Configuration
+NUM_STEPS_TO_RUN = 2  # Number of enrichment steps to execute (expandable to 4)
+
+# Step 1 Configuration
+STEP1_MODEL_PRIMARY = "google/gemini-2.5-flash"
+STEP1_MODEL_FALLBACK = "openai/gpt-5-mini"
+STEP1_TEMPERATURE = 0.3
+STEP1_MAX_TOKENS = 50
+STEP1_PROMPT_TEMPLATE = "In 2 words tell me what kind of company this is based on the description: {exa_summary}"
+
+# Step 2 Configuration
+STEP2_MODEL_PRIMARY = "google/gemini-2.5-flash"
+STEP2_MODEL_FALLBACK = "openai/gpt-5-mini"
+STEP2_TEMPERATURE = 0.3
+STEP2_MAX_TOKENS = 50
+STEP2_PROMPT_TEMPLATE = "Given this company description: {exa_summary}. And this prior result: {step1_output}. Provide one sentence expanding on the category."
+
+# Step 3 Configuration (for future expansion)
+STEP3_MODEL_PRIMARY = "google/gemini-2.5-flash"
+STEP3_MODEL_FALLBACK = "openai/gpt-5-mini"
+STEP3_TEMPERATURE = 0.3
+STEP3_MAX_TOKENS = 50
+STEP3_PROMPT_TEMPLATE = "{exa_summary} {step1_output} {step2_output}"
+
+# Step 4 Configuration (for future expansion)
+STEP4_MODEL_PRIMARY = "google/gemini-2.5-flash"
+STEP4_MODEL_FALLBACK = "openai/gpt-5-mini"
+STEP4_TEMPERATURE = 0.3
+STEP4_MAX_TOKENS = 50
+STEP4_PROMPT_TEMPLATE = "{exa_summary} {step1_output} {step2_output} {step3_output}"
 
 
 class EnrichmentWorkflow:
@@ -379,70 +403,156 @@ class EnrichmentWorkflow:
             print(f"Error getting Exa summary for {website}: {str(e)}")
             return None
     
-    async def get_company_category(self, exa_summary: str) -> Optional[str]:
+    async def _call_llm_with_retry(
+        self,
+        step_num: int,
+        prompt: str,
+        model_primary: str,
+        model_fallback: str,
+        temperature: float,
+        max_tokens: int
+    ) -> Optional[str]:
         """
-        Get 2-word company category from OpenRouter LLM based on Exa summary.
-        Uses primary model with automatic fallback to secondary model on failure.
+        Call OpenRouter LLM with retry logic (primary model with fallback).
         
         Args:
-            exa_summary: The company summary from Exa.AI
+            step_num: Step number (for logging)
+            prompt: The prompt to send to the LLM
+            model_primary: Primary model to use
+            model_fallback: Fallback model if primary fails
+            temperature: Temperature setting
+            max_tokens: Max tokens setting
             
         Returns:
-            2-word category string or None if error occurs
+            Response text or None if all attempts fail
         """
-        # Format prompt using template
-        prompt = LLM_PROMPT_TEMPLATE.format(exa_summary=exa_summary)
+        max_retries = 3
+        backoff_delays = [1, 2]  # 1s, then 2s
         
         # Try primary model first
-        try:
-            response = await self.openrouter_client.chat.completions.create(
-                model=LLM_MODEL_PRIMARY,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=LLM_MAX_TOKENS,
-                temperature=LLM_TEMPERATURE
-            )
-            
-            if response and response.choices and len(response.choices) > 0:
-                category = response.choices[0].message.content.strip()
-                # Remove quotes if present
-                category = category.strip('"\'')
-                # Take first 2 words
-                words = category.split()[:2]
-                return ' '.join(words)
-            
-            return None
-        except Exception as e:
-            # Primary model failed, try fallback
-            print(f"Primary model failed; retrying with fallback")
+        for attempt in range(max_retries):
             try:
                 response = await self.openrouter_client.chat.completions.create(
-                    model=LLM_MODEL_FALLBACK,
+                    model=model_primary,
                     messages=[
                         {"role": "user", "content": prompt}
                     ],
-                    max_tokens=LLM_MAX_TOKENS,
-                    temperature=LLM_TEMPERATURE
+                    max_tokens=max_tokens,
+                    temperature=temperature
                 )
                 
                 if response and response.choices and len(response.choices) > 0:
-                    category = response.choices[0].message.content.strip()
-                    # Remove quotes if present
-                    category = category.strip('"\'')
-                    # Take first 2 words
-                    words = category.split()[:2]
-                    return ' '.join(words)
+                    result = response.choices[0].message.content.strip()
+                    return result
                 
-                return None
-            except Exception as e2:
-                # Fallback also failed
-                print(f"Error getting company category from OpenRouter: {str(e2)}")
-                return None
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+                    print(f"  [Step {step_num}] Primary model attempt {attempt + 1} failed, retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    print(f"  [Step {step_num}] Primary model failed after {max_retries} attempts, trying fallback...")
+        
+        # Try fallback model
+        for attempt in range(max_retries):
+            try:
+                response = await self.openrouter_client.chat.completions.create(
+                    model=model_fallback,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature
+                )
+                
+                if response and response.choices and len(response.choices) > 0:
+                    result = response.choices[0].message.content.strip()
+                    print(f"  [Step {step_num}] Fallback model succeeded")
+                    return result
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+                    print(f"  [Step {step_num}] Fallback model attempt {attempt + 1} failed, retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    print(f"  [Step {step_num}] Fallback model failed after {max_retries} attempts")
+        
+        return None
+    
+    async def _run_enrichment_step(
+        self,
+        step_num: int,
+        exa_summary: str,
+        step_outputs: Dict[int, str]
+    ) -> Optional[str]:
+        """
+        Run a single enrichment step.
+        
+        Args:
+            step_num: Step number (1-4)
+            exa_summary: The Exa summary
+            step_outputs: Dictionary of previous step outputs (key: step_num, value: output)
+            
+        Returns:
+            Step output or None if failed
+        """
+        # Get step configuration
+        config_map = {
+            1: {
+                'model_primary': STEP1_MODEL_PRIMARY,
+                'model_fallback': STEP1_MODEL_FALLBACK,
+                'temperature': STEP1_TEMPERATURE,
+                'max_tokens': STEP1_MAX_TOKENS,
+                'prompt_template': STEP1_PROMPT_TEMPLATE
+            },
+            2: {
+                'model_primary': STEP2_MODEL_PRIMARY,
+                'model_fallback': STEP2_MODEL_FALLBACK,
+                'temperature': STEP2_TEMPERATURE,
+                'max_tokens': STEP2_MAX_TOKENS,
+                'prompt_template': STEP2_PROMPT_TEMPLATE
+            },
+            3: {
+                'model_primary': STEP3_MODEL_PRIMARY,
+                'model_fallback': STEP3_MODEL_FALLBACK,
+                'temperature': STEP3_TEMPERATURE,
+                'max_tokens': STEP3_MAX_TOKENS,
+                'prompt_template': STEP3_PROMPT_TEMPLATE
+            },
+            4: {
+                'model_primary': STEP4_MODEL_PRIMARY,
+                'model_fallback': STEP4_MODEL_FALLBACK,
+                'temperature': STEP4_TEMPERATURE,
+                'max_tokens': STEP4_MAX_TOKENS,
+                'prompt_template': STEP4_PROMPT_TEMPLATE
+            }
+        }
+        
+        config = config_map[step_num]
+        
+        # Format prompt with placeholders
+        prompt = config['prompt_template'].format(
+            exa_summary=exa_summary,
+            step1_output=step_outputs.get(1, ''),
+            step2_output=step_outputs.get(2, ''),
+            step3_output=step_outputs.get(3, ''),
+            step4_output=step_outputs.get(4, '')
+        )
+        
+        # Call LLM with retry
+        return await self._call_llm_with_retry(
+            step_num=step_num,
+            prompt=prompt,
+            model_primary=config['model_primary'],
+            model_fallback=config['model_fallback'],
+            temperature=config['temperature'],
+            max_tokens=config['max_tokens']
+        )
     
     async def enrich_prospect(self, prospect: Dict[str, Any], semaphore: asyncio.Semaphore) -> None:
         """
-        Enrich a single prospect with Exa summary and OpenRouter category.
+        Enrich a single prospect with Exa summary and multi-step OpenRouter enrichment.
         
         Args:
             prospect: Dictionary containing prospect data (must have 'id' and 'website' fields)
@@ -454,7 +564,7 @@ class EnrichmentWorkflow:
             
             if not website:
                 print(f"  [ERROR] Prospect {prospect_id} has no website, marking as error")
-                await self._update_prospect_status(prospect_id, 'error', None, None)
+                await self._update_prospect_status(prospect_id, 'error', None, {})
                 return
             
             try:
@@ -463,36 +573,111 @@ class EnrichmentWorkflow:
                 
                 if not exa_summary:
                     print(f"  [ERROR] No summary found for {website} (ID: {prospect_id}), marking as error")
-                    await self._update_prospect_status(prospect_id, 'error', None, None)
+                    await self._update_prospect_status(prospect_id, 'error', None, {})
                     return
                 
-                # Get company category from OpenRouter
-                company_category = await self.get_company_category(exa_summary)
+                # Get existing step outputs from prospect data
+                existing_outputs = {}
+                for step in range(1, 5):
+                    step_key = f'step{step}_output'
+                    if step_key in prospect and prospect[step_key]:
+                        existing_outputs[step] = prospect[step_key]
                 
-                if not company_category:
-                    print(f"  [ERROR] No category found for {website} (ID: {prospect_id}), marking as error")
-                    await self._update_prospect_status(prospect_id, 'error', exa_summary, None)
-                    return
+                # Track outputs as we generate them
+                step_outputs = existing_outputs.copy()
                 
-                # Update prospect with enriched data
-                await self._update_prospect_status(
-                    prospect_id, 
-                    'enriched', 
-                    exa_summary, 
-                    company_category
-                )
+                # Run enrichment steps sequentially
+                for step_num in range(1, NUM_STEPS_TO_RUN + 1):
+                    # Skip if this step already has output
+                    if step_num in step_outputs and step_outputs[step_num]:
+                        continue
+                    
+                    # Ensure all previous required steps have outputs
+                    all_previous_complete = True
+                    for prev_step in range(1, step_num):
+                        if prev_step not in step_outputs or not step_outputs[prev_step]:
+                            all_previous_complete = False
+                            break
+                    
+                    if not all_previous_complete:
+                        print(f"  [ERROR] Prospect {prospect_id}: Step {step_num} cannot run - previous steps incomplete")
+                        await self._update_prospect_status(prospect_id, 'error', exa_summary, step_outputs)
+                        return
+                    
+                    # Run the step
+                    step_result = await self._run_enrichment_step(step_num, exa_summary, step_outputs)
+                    
+                    if not step_result:
+                        print(f"  [ERROR] Prospect {prospect_id}: Step {step_num} failed")
+                        await self._update_prospect_status(prospect_id, 'error', exa_summary, step_outputs)
+                        return
+                    
+                    # Store the result
+                    step_outputs[step_num] = step_result
+                    
+                    # Update prospect with this step's output (progressive update)
+                    await self._update_prospect_step_output(prospect_id, step_num, step_result, exa_summary)
+                
+                # Final status update - check if all required steps are complete
+                all_steps_complete = True
+                for step_num in range(1, NUM_STEPS_TO_RUN + 1):
+                    if step_num not in step_outputs or not step_outputs[step_num]:
+                        all_steps_complete = False
+                        break
+                
+                if all_steps_complete:
+                    await self._update_prospect_status(prospect_id, 'enriched', exa_summary, step_outputs)
+                else:
+                    await self._update_prospect_status(prospect_id, 'error', exa_summary, step_outputs)
                 
             except Exception as e:
                 # Catch any unexpected errors and mark as error
                 print(f"  [ERROR] Unexpected error processing prospect {prospect_id} ({website}): {str(e)}")
-                await self._update_prospect_status(prospect_id, 'error', None, None)
+                await self._update_prospect_status(prospect_id, 'error', None, {})
+    
+    async def _update_prospect_step_output(
+        self,
+        prospect_id: Any,
+        step_num: int,
+        step_output: str,
+        exa_summary: Optional[str]
+    ) -> None:
+        """
+        Update prospect with a single step's output (progressive update).
+        
+        Args:
+            prospect_id: The ID of the prospect to update
+            step_num: Step number (1-4)
+            step_output: The output from this step
+            exa_summary: The Exa summary (update if not already set)
+        """
+        try:
+            update_data = {f'step{step_num}_output': step_output}
+            
+            # Also update exa_summary if provided and not already set
+            if exa_summary is not None:
+                update_data['exa_summary'] = exa_summary
+            
+            # Use asyncio.to_thread for the synchronous Supabase call
+            def update_prospect():
+                return (
+                    self.supabase.table('prospects')
+                    .update(update_data)
+                    .eq('id', prospect_id)
+                    .execute()
+                )
+            
+            await asyncio.to_thread(update_prospect)
+            
+        except Exception as e:
+            print(f"  [ERROR] Failed to update prospect {prospect_id} step {step_num} in database: {str(e)}")
     
     async def _update_prospect_status(
         self, 
         prospect_id: Any, 
         status: str, 
         exa_summary: Optional[str], 
-        company_category: Optional[str]
+        step_outputs: Dict[int, str]
     ) -> None:
         """
         Update prospect status and enrichment data in Supabase.
@@ -501,7 +686,7 @@ class EnrichmentWorkflow:
             prospect_id: The ID of the prospect to update
             status: New status ('enriched' or 'error')
             exa_summary: The summary from Exa.AI (can be None)
-            company_category: The category from OpenRouter (can be None)
+            step_outputs: Dictionary of step outputs (key: step_num, value: output)
         """
         try:
             update_data = {'status': status}
@@ -509,8 +694,11 @@ class EnrichmentWorkflow:
             if exa_summary is not None:
                 update_data['exa_summary'] = exa_summary
             
-            if company_category is not None:
-                update_data['company_category'] = company_category
+            # Only update step outputs that are non-empty (don't overwrite existing)
+            for step_num in range(1, 5):
+                step_key = f'step{step_num}_output'
+                if step_num in step_outputs and step_outputs[step_num]:
+                    update_data[step_key] = step_outputs[step_num]
             
             # Use asyncio.to_thread for the synchronous Supabase call (using global client)
             def update_prospect():
@@ -529,6 +717,7 @@ class EnrichmentWorkflow:
     def fetch_batch(self, limit: int = BATCH_SIZE) -> list:
         """
         Fetch a batch of prospects with status 'new' from Supabase.
+        Also fetch existing step outputs to support "only fill blanks" logic.
         
         Args:
             limit: Number of rows to fetch
@@ -539,7 +728,7 @@ class EnrichmentWorkflow:
         try:
             response = (
                 self.supabase.table('prospects')
-                .select('*')
+                .select('id, website, exa_summary, step1_output, step2_output, step3_output, step4_output')
                 .eq('status', 'new')
                 .limit(limit)
                 .execute()
@@ -577,6 +766,7 @@ class EnrichmentWorkflow:
         print(f"  ✓ OpenRouter client initialized")
         print(f"  ✓ Semaphore limit: {SEMAPHORE_LIMIT} concurrent requests")
         print(f"  ✓ Batch size: {BATCH_SIZE} rows per batch")
+        print(f"  ✓ Number of enrichment steps: {NUM_STEPS_TO_RUN}")
         
         # Data cleaning phase
         print("\n[3/4] Running data cleaning phase...")
