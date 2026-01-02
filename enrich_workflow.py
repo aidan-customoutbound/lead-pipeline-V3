@@ -32,7 +32,7 @@ LLM_MODEL_PRIMARY = "google/gemini-2.5-flash-lite-preview-09-2025"
 LLM_MODEL_FALLBACK = "openai/gpt-5-mini"
 LLM_TEMPERATURE = 0.3
 LLM_MAX_TOKENS = 200
-LLM_PROMPT_TEMPLATE = "Your job is to determine whether or not a company is primarily B2B or B2C. B2B is a company that provides software, services, or products to companies. A B2C company is a company that provides software, services, or products to consumers and not companies. If there is not enough information to generate an accurate answer, you must return an empty string with no words, otherwise you must only B2B or B2C as your answer. Please take your time to generate an accurate answer. Here is the company information: {exa_summary}"
+LLM_PROMPT_TEMPLATE = "Given a company description, I want you to generate a comma separated list of this companys services. For example, if given a description of a tree trimming company, you might output tree trimming, stump grinding, free estimates, tree removal services. Here are the formatting rules for your list: 1) You cannot use any special characters like parentheses, 2) Your new list cannot be longer than 100 characters, 3) You must generate at least 3 services, 4) your answer cannot contain capital letters, and 5) your answer should start with: The new list is: . If there is not enough information to generate an accurate list, please return an empty string with no words.  Here is the company description: {exa_summary}"
 
 
 class EnrichmentWorkflow:
