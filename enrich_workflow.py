@@ -27,6 +27,7 @@ EXA_API_KEY = os.getenv("EXA_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 SEMAPHORE_LIMIT = 5  # Max concurrent requests (respects Exa's 10 QPS limit)
 BATCH_SIZE = 50  # Number of rows to fetch and process per batch
+RUN_CLEANING = False  # Enable/disable full-table cleaning phase
 
 # Multi-step AI Enrichment Configuration
 NUM_STEPS_TO_RUN = 2  # Number of enrichment steps to execute (expandable to 4)
@@ -900,8 +901,12 @@ class EnrichmentWorkflow:
         print(f"  ✓ Number of enrichment steps: {NUM_STEPS_TO_RUN}")
         
         # Data cleaning phase
-        print("\n[3/4] Running data cleaning phase...")
-        await self.clean_data()
+        print("\n[3/4] Data cleaning phase...")
+        if RUN_CLEANING:
+            print("Cleaning enabled: running clean_data()")
+            await self.clean_data()
+        else:
+            print("Cleaning disabled: skipping clean_data()")
         
         print("\n[4/4] Starting batch processing...")
         print("-" * 60)
