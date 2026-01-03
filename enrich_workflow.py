@@ -10,6 +10,7 @@ Production-ready version with batch processing for large datasets.
 import asyncio
 import os
 import time
+import uuid
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -87,6 +88,19 @@ class EnrichmentWorkflow:
                 "X-Title": "ProspectV2Workflow"
             }
         )
+        
+        # Initialize observability counters
+        self.prospects_seen = 0
+        self.prospects_enriched = 0
+        self.prospects_deferred_db_write = 0
+        self.ai_calls_attempted = 0
+        self.ai_calls_retried = 0
+        self.db_writes_attempted = 0
+        self.db_write_retries = 0
+        self.db_write_failures = 0
+        
+        # Run ID for idempotency within this run
+        self.run_id = None
     
     def _normalize_website(self, website: str) -> str:
         """
@@ -431,6 +445,7 @@ class EnrichmentWorkflow:
         
         # Try primary model first
         for attempt in range(max_retries):
+            self.ai_calls_attempted += 1
             try:
                 response = await self.openrouter_client.chat.completions.create(
                     model=model_primary,
@@ -447,6 +462,7 @@ class EnrichmentWorkflow:
                 
             except Exception as e:
                 if attempt < max_retries - 1:
+                    self.ai_calls_retried += 1
                     delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
                     print(f"  [Step {step_num}] Primary model attempt {attempt + 1} failed, retrying in {delay}s...")
                     await asyncio.sleep(delay)
@@ -455,6 +471,7 @@ class EnrichmentWorkflow:
         
         # Try fallback model
         for attempt in range(max_retries):
+            self.ai_calls_attempted += 1
             try:
                 response = await self.openrouter_client.chat.completions.create(
                     model=model_fallback,
@@ -472,6 +489,7 @@ class EnrichmentWorkflow:
                 
             except Exception as e:
                 if attempt < max_retries - 1:
+                    self.ai_calls_retried += 1
                     delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
                     print(f"  [Step {step_num}] Fallback model attempt {attempt + 1} failed, retrying in {delay}s...")
                     await asyncio.sleep(delay)
@@ -550,169 +568,255 @@ class EnrichmentWorkflow:
             max_tokens=config['max_tokens']
         )
     
-    async def enrich_prospect(self, prospect: Dict[str, Any], semaphore: asyncio.Semaphore) -> None:
+    async def _verify_write(
+        self,
+        prospect_id: Any,
+        expected_data: Dict[str, Any]
+    ) -> bool:
+        """
+        Verify that a write to Supabase was successful by re-reading the row.
+        
+        Args:
+            prospect_id: The ID of the prospect to verify
+            expected_data: Dictionary of expected field values
+            
+        Returns:
+            True if verification passes, False otherwise
+        """
+        try:
+            def read_prospect():
+                return (
+                    self.supabase.table('prospects')
+                    .select('id, status, exa_summary, step1_output, step2_output, step3_output, step4_output')
+                    .eq('id', prospect_id)
+                    .execute()
+                )
+            
+            response = await asyncio.to_thread(read_prospect)
+            
+            if not response.data or len(response.data) == 0:
+                return False
+            
+            row = response.data[0]
+            
+            # Verify status
+            if 'status' in expected_data:
+                if row.get('status') != expected_data['status']:
+                    return False
+            
+            # Verify exa_summary
+            if 'exa_summary' in expected_data and expected_data['exa_summary'] is not None:
+                if row.get('exa_summary') != expected_data['exa_summary']:
+                    return False
+            
+            # Verify step outputs
+            for step_num in range(1, NUM_STEPS_TO_RUN + 1):
+                step_key = f'step{step_num}_output'
+                if step_key in expected_data:
+                    if row.get(step_key) != expected_data[step_key]:
+                        return False
+            
+            return True
+        except Exception as e:
+            print(f"  [VERIFY] Error verifying write for prospect {prospect_id}: {str(e)}")
+            return False
+    
+    async def _write_prospect_with_retry(
+        self,
+        prospect_id: Any,
+        exa_summary: Optional[str],
+        step_outputs: Dict[int, str],
+        db_write_semaphore: asyncio.Semaphore
+    ) -> bool:
+        """
+        Write prospect data to Supabase with retry logic and verification.
+        
+        Args:
+            prospect_id: The ID of the prospect to update
+            exa_summary: The summary from Exa.AI (can be None)
+            step_outputs: Dictionary of step outputs (key: step_num, value: output)
+            db_write_semaphore: Semaphore to serialize DB writes (concurrency=1)
+            
+        Returns:
+            True if write succeeded and was verified, False otherwise
+        """
+        async with db_write_semaphore:
+            self.db_writes_attempted += 1
+            
+            # Build update data
+            update_data = {'status': 'enriched'}
+            
+            if exa_summary is not None:
+                update_data['exa_summary'] = exa_summary
+            
+            # Only include step outputs for required steps (1..NUM_STEPS_TO_RUN)
+            for step_num in range(1, NUM_STEPS_TO_RUN + 1):
+                step_key = f'step{step_num}_output'
+                if step_num in step_outputs and step_outputs[step_num]:
+                    update_data[step_key] = step_outputs[step_num]
+            
+            # Retry logic with linear backoff (1s, 2s, 3s)
+            max_retries = 3
+            backoff_delays = [1, 2, 3]
+            
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    self.db_write_retries += 1
+                    delay = backoff_delays[min(attempt - 1, len(backoff_delays) - 1)]
+                    print(f"  [DB WRITE] Prospect {prospect_id} (run_id: {self.run_id}): Retry {attempt} after {delay}s...")
+                    await asyncio.sleep(delay)
+                
+                try:
+                    # Perform the write
+                    def update_prospect():
+                        return (
+                            self.supabase.table('prospects')
+                            .update(update_data)
+                            .eq('id', prospect_id)
+                            .execute()
+                        )
+                    
+                    await asyncio.to_thread(update_prospect)
+                    
+                    # Verify the write
+                    if await self._verify_write(prospect_id, update_data):
+                        # Success - immediately discard cached data (memory safety)
+                        return True
+                    else:
+                        print(f"  [DB WRITE] Prospect {prospect_id} (run_id: {self.run_id}): Write verification failed on attempt {attempt + 1}")
+                        if attempt == max_retries - 1:
+                            self.db_write_failures += 1
+                            return False
+                
+                except Exception as e:
+                    print(f"  [DB WRITE] Prospect {prospect_id} (run_id: {self.run_id}): Write attempt {attempt + 1} failed: {str(e)}")
+                    if attempt == max_retries - 1:
+                        self.db_write_failures += 1
+                        return False
+            
+            return False
+    
+    async def enrich_prospect(
+        self,
+        prospect: Dict[str, Any],
+        ai_semaphore: asyncio.Semaphore,
+        db_write_semaphore: asyncio.Semaphore
+    ) -> None:
         """
         Enrich a single prospect with Exa summary and multi-step OpenRouter enrichment.
+        Caches all AI results in memory and writes to Supabase only once after all steps complete.
         
         Args:
             prospect: Dictionary containing prospect data (must have 'id' and 'website' fields)
-            semaphore: Semaphore to limit concurrent requests
+            ai_semaphore: Semaphore to limit concurrent AI requests
+            db_write_semaphore: Semaphore to serialize DB writes (concurrency=1)
         """
-        async with semaphore:
-            prospect_id = prospect.get('id')
-            website = prospect.get('website')
-            
+        self.prospects_seen += 1
+        prospect_id = prospect.get('id')
+        website = prospect.get('website')
+        
+        # Check if prospect is eligible (has at least one blank required step)
+        has_blank_step = False
+        for step_num in range(1, NUM_STEPS_TO_RUN + 1):
+            step_key = f'step{step_num}_output'
+            if step_key not in prospect or not prospect[step_key]:
+                has_blank_step = True
+                break
+        
+        if not has_blank_step:
+            # All required steps already have output, skip this prospect
+            return
+        
+        async with ai_semaphore:
             if not website:
-                print(f"  [ERROR] Prospect {prospect_id} has no website, marking as error")
-                await self._update_prospect_status(prospect_id, 'error', None, {})
+                print(f"  [ERROR] Prospect {prospect_id} (run_id: {self.run_id}) has no website")
                 return
             
+            # In-memory cache for AI results
+            cached_exa_summary: Optional[str] = None
+            cached_step_outputs: Dict[int, str] = {}
+            
             try:
-                # Get Exa summary
-                exa_summary = await self.get_exa_summary(website)
-                
-                if not exa_summary:
-                    print(f"  [ERROR] No summary found for {website} (ID: {prospect_id}), marking as error")
-                    await self._update_prospect_status(prospect_id, 'error', None, {})
-                    return
-                
                 # Get existing step outputs from prospect data
-                existing_outputs = {}
                 for step in range(1, 5):
                     step_key = f'step{step}_output'
                     if step_key in prospect and prospect[step_key]:
-                        existing_outputs[step] = prospect[step_key]
+                        cached_step_outputs[step] = prospect[step_key]
                 
-                # Track outputs as we generate them
-                step_outputs = existing_outputs.copy()
+                # Get Exa summary (use existing if available, otherwise fetch)
+                if prospect.get('exa_summary'):
+                    cached_exa_summary = prospect['exa_summary']
+                else:
+                    cached_exa_summary = await self.get_exa_summary(website)
                 
-                # Run enrichment steps sequentially
+                if not cached_exa_summary:
+                    print(f"  [ERROR] No summary found for {website} (ID: {prospect_id}, run_id: {self.run_id})")
+                    return
+                
+                # Run all required enrichment steps sequentially, caching outputs in memory
                 for step_num in range(1, NUM_STEPS_TO_RUN + 1):
                     # Skip if this step already has output
-                    if step_num in step_outputs and step_outputs[step_num]:
+                    if step_num in cached_step_outputs and cached_step_outputs[step_num]:
                         continue
                     
                     # Ensure all previous required steps have outputs
                     all_previous_complete = True
                     for prev_step in range(1, step_num):
-                        if prev_step not in step_outputs or not step_outputs[prev_step]:
+                        if prev_step not in cached_step_outputs or not cached_step_outputs[prev_step]:
                             all_previous_complete = False
                             break
                     
                     if not all_previous_complete:
-                        print(f"  [ERROR] Prospect {prospect_id}: Step {step_num} cannot run - previous steps incomplete")
-                        await self._update_prospect_status(prospect_id, 'error', exa_summary, step_outputs)
+                        print(f"  [ERROR] Prospect {prospect_id} (run_id: {self.run_id}): Step {step_num} cannot run - previous steps incomplete")
                         return
                     
                     # Run the step
-                    step_result = await self._run_enrichment_step(step_num, exa_summary, step_outputs)
+                    step_result = await self._run_enrichment_step(step_num, cached_exa_summary, cached_step_outputs)
                     
                     if not step_result:
-                        print(f"  [ERROR] Prospect {prospect_id}: Step {step_num} failed")
-                        await self._update_prospect_status(prospect_id, 'error', exa_summary, step_outputs)
+                        print(f"  [ERROR] Prospect {prospect_id} (run_id: {self.run_id}): Step {step_num} failed")
                         return
                     
-                    # Store the result
-                    step_outputs[step_num] = step_result
-                    
-                    # Update prospect with this step's output (progressive update)
-                    await self._update_prospect_step_output(prospect_id, step_num, step_result, exa_summary)
+                    # Store the result in memory cache
+                    cached_step_outputs[step_num] = step_result
                 
-                # Final status update - check if all required steps are complete
+                # Verify all required steps are complete
                 all_steps_complete = True
                 for step_num in range(1, NUM_STEPS_TO_RUN + 1):
-                    if step_num not in step_outputs or not step_outputs[step_num]:
+                    if step_num not in cached_step_outputs or not cached_step_outputs[step_num]:
                         all_steps_complete = False
                         break
                 
-                if all_steps_complete:
-                    await self._update_prospect_status(prospect_id, 'enriched', exa_summary, step_outputs)
+                if not all_steps_complete:
+                    print(f"  [ERROR] Prospect {prospect_id} (run_id: {self.run_id}): Not all required steps completed")
+                    return
+                
+                # All steps succeeded - perform single final write to Supabase
+                write_success = await self._write_prospect_with_retry(
+                    prospect_id,
+                    cached_exa_summary,
+                    cached_step_outputs,
+                    db_write_semaphore
+                )
+                
+                if write_success:
+                    self.prospects_enriched += 1
+                    # Immediately discard cached data (memory safety)
+                    cached_exa_summary = None
+                    cached_step_outputs = {}
                 else:
-                    await self._update_prospect_status(prospect_id, 'error', exa_summary, step_outputs)
+                    self.prospects_deferred_db_write += 1
+                    print(f"  [DEFERRED] Prospect {prospect_id} (run_id: {self.run_id}): All retries failed. Row remains status='new' for next run.")
+                    # Discard cached data even on failure (memory safety)
+                    cached_exa_summary = None
+                    cached_step_outputs = {}
                 
             except Exception as e:
-                # Catch any unexpected errors and mark as error
-                print(f"  [ERROR] Unexpected error processing prospect {prospect_id} ({website}): {str(e)}")
-                await self._update_prospect_status(prospect_id, 'error', None, {})
-    
-    async def _update_prospect_step_output(
-        self,
-        prospect_id: Any,
-        step_num: int,
-        step_output: str,
-        exa_summary: Optional[str]
-    ) -> None:
-        """
-        Update prospect with a single step's output (progressive update).
-        
-        Args:
-            prospect_id: The ID of the prospect to update
-            step_num: Step number (1-4)
-            step_output: The output from this step
-            exa_summary: The Exa summary (update if not already set)
-        """
-        try:
-            update_data = {f'step{step_num}_output': step_output}
-            
-            # Also update exa_summary if provided and not already set
-            if exa_summary is not None:
-                update_data['exa_summary'] = exa_summary
-            
-            # Use asyncio.to_thread for the synchronous Supabase call
-            def update_prospect():
-                return (
-                    self.supabase.table('prospects')
-                    .update(update_data)
-                    .eq('id', prospect_id)
-                    .execute()
-                )
-            
-            await asyncio.to_thread(update_prospect)
-            
-        except Exception as e:
-            print(f"  [ERROR] Failed to update prospect {prospect_id} step {step_num} in database: {str(e)}")
-    
-    async def _update_prospect_status(
-        self, 
-        prospect_id: Any, 
-        status: str, 
-        exa_summary: Optional[str], 
-        step_outputs: Dict[int, str]
-    ) -> None:
-        """
-        Update prospect status and enrichment data in Supabase.
-        
-        Args:
-            prospect_id: The ID of the prospect to update
-            status: New status ('enriched' or 'error')
-            exa_summary: The summary from Exa.AI (can be None)
-            step_outputs: Dictionary of step outputs (key: step_num, value: output)
-        """
-        try:
-            update_data = {'status': status}
-            
-            if exa_summary is not None:
-                update_data['exa_summary'] = exa_summary
-            
-            # Only update step outputs that are non-empty (don't overwrite existing)
-            for step_num in range(1, 5):
-                step_key = f'step{step_num}_output'
-                if step_num in step_outputs and step_outputs[step_num]:
-                    update_data[step_key] = step_outputs[step_num]
-            
-            # Use asyncio.to_thread for the synchronous Supabase call (using global client)
-            def update_prospect():
-                return (
-                    self.supabase.table('prospects')
-                    .update(update_data)
-                    .eq('id', prospect_id)
-                    .execute()
-                )
-            
-            await asyncio.to_thread(update_prospect)
-            
-        except Exception as e:
-            print(f"  [ERROR] Failed to update prospect {prospect_id} in database: {str(e)}")
+                # Catch any unexpected errors
+                print(f"  [ERROR] Unexpected error processing prospect {prospect_id} ({website}, run_id: {self.run_id}): {str(e)}")
+                # Discard cached data on error (memory safety)
+                cached_exa_summary = None
+                cached_step_outputs = {}
     
     def fetch_batch(self, limit: int = BATCH_SIZE) -> list:
         """
@@ -746,11 +850,15 @@ class EnrichmentWorkflow:
         Fetches 50 rows at a time, processes them, then fetches the next batch.
         Continues until no more rows with status='new' are found.
         """
+        # Generate run_id for idempotency within this run
+        self.run_id = str(uuid.uuid4())[:8]
+        
         # Capture start time at the very beginning
         start_time = time.time()
         
         print("=" * 60)
         print("Starting enrichment workflow (Production Mode)")
+        print(f"Run ID: {self.run_id}")
         print("=" * 60)
         
         # Test Supabase connection first
@@ -764,7 +872,8 @@ class EnrichmentWorkflow:
         print(f"  ✓ Supabase client initialized")
         print(f"  ✓ Exa.AI client initialized")
         print(f"  ✓ OpenRouter client initialized")
-        print(f"  ✓ Semaphore limit: {SEMAPHORE_LIMIT} concurrent requests")
+        print(f"  ✓ AI Semaphore limit: {SEMAPHORE_LIMIT} concurrent requests")
+        print(f"  ✓ DB Write Semaphore: 1 (serialized writes)")
         print(f"  ✓ Batch size: {BATCH_SIZE} rows per batch")
         print(f"  ✓ Number of enrichment steps: {NUM_STEPS_TO_RUN}")
         
@@ -775,8 +884,11 @@ class EnrichmentWorkflow:
         print("\n[4/4] Starting batch processing...")
         print("-" * 60)
         
-        # Create semaphore for rate limiting (shared across all batches)
-        semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
+        # Create semaphores
+        # AI semaphore for rate limiting (shared across all batches)
+        ai_semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
+        # DB write semaphore with concurrency=1 (serialized writes)
+        db_write_semaphore = asyncio.Semaphore(1)
         
         # Batch processing loop
         total_processed = 0
@@ -796,9 +908,9 @@ class EnrichmentWorkflow:
             
             print(f"[Batch {batch_number}] Fetched {len(batch)} prospects. Processing...")
             
-            # Process this batch concurrently with semaphore
+            # Process this batch concurrently with AI semaphore
             tasks = [
-                self.enrich_prospect(prospect, semaphore)
+                self.enrich_prospect(prospect, ai_semaphore, db_write_semaphore)
                 for prospect in batch
             ]
             
@@ -824,9 +936,22 @@ class EnrichmentWorkflow:
         
         print("-" * 60)
         print(f"\n✓ Enrichment workflow completed!")
+        print(f"✓ Run ID: {self.run_id}")
         print(f"✓ Total prospects processed: {total_processed}")
         print(f"✓ Total time elapsed: {duration_minutes} min {duration_secs} sec")
         print(f"✓ Average speed: {avg_seconds_per_prospect:.2f} seconds per prospect")
+        print("-" * 60)
+        
+        # Print observability counters
+        print("\n=== OBSERVABILITY METRICS ===")
+        print(f"prospects_seen: {self.prospects_seen}")
+        print(f"prospects_enriched: {self.prospects_enriched}")
+        print(f"prospects_deferred_db_write: {self.prospects_deferred_db_write}")
+        print(f"ai_calls_attempted: {self.ai_calls_attempted}")
+        print(f"ai_calls_retried: {self.ai_calls_retried}")
+        print(f"db_writes_attempted: {self.db_writes_attempted}")
+        print(f"db_write_retries: {self.db_write_retries}")
+        print(f"db_write_failures: {self.db_write_failures}")
         print("=" * 60)
 
 
