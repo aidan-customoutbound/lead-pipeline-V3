@@ -2,11 +2,12 @@
 Bulk upload script for prospect websites.
 
 This script reads websites from input.csv and uploads them to the Supabase prospects table,
-skipping duplicates.
+skipping duplicates. It also uploads prompts from the Prompts column to the public.prompts table.
 """
 
 import csv
 import os
+import sys
 from typing import Set, List, Dict, Optional
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -21,7 +22,7 @@ INPUT_CSV = "input.csv"
 
 
 class CSVUploader:
-    """Handles CSV upload to Supabase prospects table."""
+    """Handles CSV upload to Supabase prospects table and prompts table."""
     
     def __init__(self):
         """Initialize Supabase client."""
@@ -85,6 +86,99 @@ class CSVUploader:
             # For other errors, assume column exists (safer to try)
             self.has_prompts_column = True
             return True
+    
+    def extract_prompts_from_csv(self, csv_path: str) -> tuple[List[str], int]:
+        """
+        Extract and normalize prompts from the Prompts column in the CSV.
+        
+        Args:
+            csv_path: Path to the CSV file
+            
+        Returns:
+            Tuple of (deduplicated prompts list, raw count before deduplication)
+        """
+        prompts_raw = []
+        
+        try:
+            with open(csv_path, 'r', encoding='utf-8') as csvfile:
+                reader = csv.DictReader(csvfile)
+                
+                # Check if Prompts column exists
+                if reader.fieldnames is None:
+                    raise ValueError("CSV file appears to be empty or invalid.")
+                
+                if 'Prompts' not in reader.fieldnames:
+                    raise ValueError(
+                        f"CSV file is missing required header: 'Prompts'. "
+                        f"Found columns: {', '.join(reader.fieldnames)}"
+                    )
+                
+                # Collect all non-empty prompts
+                for row in reader:
+                    prompt = row.get('Prompts', '').strip()
+                    if prompt:  # Only add non-empty prompts after stripping
+                        prompts_raw.append(prompt)
+            
+            prompts_found_raw = len(prompts_raw)
+            
+            # Deduplicate while preserving order
+            prompts_seen = set()
+            prompts_deduplicated = []
+            for prompt in prompts_raw:
+                if prompt not in prompts_seen:
+                    prompts_seen.add(prompt)
+                    prompts_deduplicated.append(prompt)
+            
+            return prompts_deduplicated, prompts_found_raw
+            
+        except FileNotFoundError:
+            raise FileNotFoundError(f"CSV file not found: {csv_path}")
+        except Exception as e:
+            raise Exception(f"Error reading prompts from CSV file: {str(e)}")
+    
+    def upload_prompts(self, prompts: List[str]) -> None:
+        """
+        Replace all prompts in public.prompts table with the new prompt list.
+        
+        Args:
+            prompts: List of prompt strings to insert
+            
+        Raises:
+            Exception: If upload fails
+        """
+        try:
+            # Delete all existing prompts
+            # Use a condition that matches all rows (step_order >= 0 should match all valid rows)
+            delete_response = (
+                self.supabase.table('prompts')
+                .delete()
+                .gte('step_order', 0)
+                .execute()
+            )
+            
+            # If no prompts to insert, we're done
+            if not prompts:
+                return
+            
+            # Prepare insert data
+            insert_data = []
+            for idx, prompt_text in enumerate(prompts, start=1):
+                insert_data.append({
+                    'step_order': idx,
+                    'prompt_text': prompt_text,
+                    'is_active': True,
+                    'step_name': f'step{idx}'
+                })
+            
+            # Insert new prompts
+            insert_response = (
+                self.supabase.table('prompts')
+                .insert(insert_data)
+                .execute()
+            )
+            
+        except Exception as e:
+            raise Exception(f"Error uploading prompts to database: {str(e)}")
     
     def get_existing_websites(self) -> Set[str]:
         """
@@ -165,7 +259,7 @@ class CSVUploader:
             csv_path: Path to the CSV file
             
         Returns:
-            List of dictionaries with 'website', 'short_description', 'prompts' keys
+            List of dictionaries with 'website', 'short_description' keys
         """
         rows = []
         
@@ -189,12 +283,10 @@ class CSVUploader:
                 for row_num, row in enumerate(reader, start=2):  # Start at 2 (header is row 1)
                     website = row.get('Website', '').strip()
                     short_description = row.get('Short Description', '').strip()
-                    prompts = row.get('Prompts', '').strip()
                     
                     rows.append({
                         'website': website,
-                        'short_description': short_description if short_description else None,
-                        'prompts': prompts if prompts else None
+                        'short_description': short_description if short_description else None
                     })
             
             return rows
@@ -208,7 +300,7 @@ class CSVUploader:
         Upload new rows to Supabase, skipping duplicates.
         
         Args:
-            rows: List of row dictionaries with website, short_description, prompts
+            rows: List of row dictionaries with website, short_description
             existing_websites: Set of normalized existing websites
             
         Returns:
@@ -219,9 +311,6 @@ class CSVUploader:
         skipped_duplicate_count = 0
         failed_count = 0
         new_rows = []
-        
-        # Check if prompts column exists
-        has_prompts = self.check_prompts_column()
         
         # Filter out duplicates and blank websites
         for row in rows:
@@ -245,10 +334,6 @@ class CSVUploader:
                     'status': 'new'
                 }
                 
-                # Add prompts only if column exists and value is present
-                if has_prompts and row['prompts']:
-                    insert_data['prompts'] = row['prompts']
-                
                 new_rows.append(insert_data)
                 # Add to existing set to avoid duplicates within the same batch
                 existing_websites.add(normalized)
@@ -269,31 +354,8 @@ class CSVUploader:
                         inserted_count += len(batch)
                         print(f"Uploaded batch: {len(batch)} rows (total: {inserted_count})")
                     except Exception as e:
-                        # If error is about prompts column, retry without prompts
-                        error_str = str(e).lower()
-                        if has_prompts and 'prompts' in error_str and ('column' in error_str or 'does not exist' in error_str):
-                            # Retry batch without prompts
-                            self.has_prompts_column = False
-                            batch_without_prompts = []
-                            for item in batch:
-                                item_copy = item.copy()
-                                item_copy.pop('prompts', None)
-                                batch_without_prompts.append(item_copy)
-                            
-                            try:
-                                response = (
-                                    self.supabase.table('prospects')
-                                    .insert(batch_without_prompts)
-                                    .execute()
-                                )
-                                inserted_count += len(batch_without_prompts)
-                                print(f"Uploaded batch: {len(batch_without_prompts)} rows without prompts (total: {inserted_count})")
-                            except Exception as retry_error:
-                                print(f"Error uploading batch (retry without prompts): {str(retry_error)}")
-                                failed_count += len(batch)
-                        else:
-                            print(f"Error uploading batch: {str(e)}")
-                            failed_count += len(batch)
+                        print(f"Error uploading batch: {str(e)}")
+                        failed_count += len(batch)
             except Exception as e:
                 print(f"Error during batch upload: {str(e)}")
                 failed_count += len(new_rows) - inserted_count
@@ -309,16 +371,41 @@ class CSVUploader:
         print("Testing Supabase connection...")
         if not self.test_connection():
             print("Cannot proceed without a valid Supabase connection.")
-            return
+            sys.exit(1)
         
         print("-" * 50)
         
         # Check if CSV file exists
         if not os.path.exists(INPUT_CSV):
             print(f"Error: {INPUT_CSV} not found in the current directory.")
-            return
+            sys.exit(1)
         
-        # Read rows from CSV
+        # Extract and upload prompts FIRST (before prospect upload)
+        print("Extracting prompts from CSV...")
+        try:
+            prompts_deduplicated, prompts_found_raw = self.extract_prompts_from_csv(INPUT_CSV)
+            prompts_inserted = len(prompts_deduplicated)
+            
+            print(f"Found {prompts_found_raw} non-empty prompts (raw)")
+            print(f"After deduplication: {prompts_inserted} unique prompts")
+            
+            # If zero prompts found, log error and exit
+            if prompts_inserted == 0:
+                print("ERROR: Zero prompts found in CSV. Aborting to prevent accidental deletion of prompts table.")
+                sys.exit(1)
+            
+            # Upload prompts
+            print("Uploading prompts to public.prompts...")
+            self.upload_prompts(prompts_deduplicated)
+            print(f"Deleted existing prompts and inserted {prompts_inserted} new prompts.")
+            
+        except Exception as e:
+            print(f"ERROR: Failed to upload prompts: {str(e)}")
+            sys.exit(1)
+        
+        print("-" * 50)
+        
+        # Read rows from CSV for prospects
         print(f"Reading rows from {INPUT_CSV}...")
         try:
             rows = self.read_csv_rows(INPUT_CSV)
@@ -362,9 +449,10 @@ def main():
         uploader.run()
     except ValueError as e:
         print(f"Configuration error: {str(e)}")
+        sys.exit(1)
     except Exception as e:
         print(f"Fatal error: {str(e)}")
-        raise
+        sys.exit(1)
 
 
 if __name__ == "__main__":
