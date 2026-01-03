@@ -7,7 +7,7 @@ skipping duplicates.
 
 import csv
 import os
-from typing import Set, List
+from typing import Set, List, Dict, Optional
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -34,6 +34,7 @@ class CSVUploader:
         
         # Initialize Supabase client
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        self.has_prompts_column: Optional[bool] = None
     
     def test_connection(self) -> bool:
         """
@@ -54,6 +55,36 @@ class CSVUploader:
         except Exception as e:
             print(f"✗ Error connecting to Supabase: {str(e)}")
             return False
+    
+    def check_prompts_column(self) -> bool:
+        """
+        Check if the prospects table has a 'prompts' column.
+        
+        Returns:
+            True if column exists, False otherwise
+        """
+        if self.has_prompts_column is not None:
+            return self.has_prompts_column
+        
+        try:
+            # Try to select prompts column - if it doesn't exist, this will fail
+            response = (
+                self.supabase.table('prospects')
+                .select('prompts')
+                .limit(1)
+                .execute()
+            )
+            self.has_prompts_column = True
+            return True
+        except Exception as e:
+            # If error mentions column doesn't exist, mark as False
+            error_str = str(e).lower()
+            if 'column' in error_str and ('does not exist' in error_str or 'not found' in error_str):
+                self.has_prompts_column = False
+                return False
+            # For other errors, assume column exists (safer to try)
+            self.has_prompts_column = True
+            return True
     
     def get_existing_websites(self) -> Set[str]:
         """
@@ -78,7 +109,7 @@ class CSVUploader:
                 if not response.data:
                     break
                 
-                # Normalize websites (lowercase, strip whitespace)
+                # Normalize websites
                 for row in response.data:
                     website = row.get('website')
                     if website:
@@ -97,7 +128,8 @@ class CSVUploader:
     
     def _normalize_website(self, website: str) -> str:
         """
-        Normalize website URL for comparison (remove protocol, lowercase, strip).
+        Normalize website URL: remove protocol, www, trailing slashes, convert to lowercase.
+        Matches normalization logic from enrich_workflow.py.
         
         Args:
             website: Website URL to normalize
@@ -108,104 +140,165 @@ class CSVUploader:
         if not website:
             return ""
         
-        website = website.strip().lower()
+        # Convert to lowercase
+        normalized = website.lower().strip()
         
-        # Remove protocol
-        for protocol in ['https://', 'http://', 'www.']:
-            if website.startswith(protocol):
-                website = website[len(protocol):]
+        # Remove protocol (case insensitive)
+        for protocol in ['https://', 'http://']:
+            if normalized.startswith(protocol):
+                normalized = normalized[len(protocol):]
+        
+        # Remove www. (case insensitive)
+        if normalized.startswith('www.'):
+            normalized = normalized[4:]
         
         # Remove trailing slash
-        website = website.rstrip('/')
+        normalized = normalized.rstrip('/')
         
-        return website
+        return normalized
     
-    def read_csv_websites(self, csv_path: str) -> List[str]:
+    def read_csv_rows(self, csv_path: str) -> List[Dict[str, str]]:
         """
-        Read websites from CSV file.
+        Read rows from CSV file with new format.
         
         Args:
             csv_path: Path to the CSV file
             
         Returns:
-            List of website strings
+            List of dictionaries with 'website', 'short_description', 'prompts' keys
         """
-        websites = []
+        rows = []
         
         try:
             with open(csv_path, 'r', encoding='utf-8') as csvfile:
                 reader = csv.DictReader(csvfile)
                 
-                # Check if 'website' column exists
-                if 'website' not in reader.fieldnames:
+                # Check required headers
+                if reader.fieldnames is None:
+                    raise ValueError("CSV file appears to be empty or invalid.")
+                
+                required_headers = ['Website']
+                missing_headers = [h for h in required_headers if h not in reader.fieldnames]
+                
+                if missing_headers:
                     raise ValueError(
-                        f"CSV file must have a 'website' column. "
-                        f"Found columns: {', '.join(reader.fieldnames or [])}"
+                        f"CSV file is missing required headers: {', '.join(missing_headers)}. "
+                        f"Found columns: {', '.join(reader.fieldnames)}"
                     )
                 
                 for row_num, row in enumerate(reader, start=2):  # Start at 2 (header is row 1)
-                    website = row.get('website', '').strip()
-                    if website:
-                        websites.append(website)
-                    elif website == '':
-                        # Skip empty rows but don't error
-                        continue
+                    website = row.get('Website', '').strip()
+                    short_description = row.get('Short Description', '').strip()
+                    prompts = row.get('Prompts', '').strip()
+                    
+                    rows.append({
+                        'website': website,
+                        'short_description': short_description if short_description else None,
+                        'prompts': prompts if prompts else None
+                    })
             
-            return websites
+            return rows
         except FileNotFoundError:
             raise FileNotFoundError(f"CSV file not found: {csv_path}")
         except Exception as e:
             raise Exception(f"Error reading CSV file: {str(e)}")
     
-    def upload_websites(self, websites: List[str], existing_websites: Set[str]) -> tuple[int, int]:
+    def upload_rows(self, rows: List[Dict[str, str]], existing_websites: Set[str]) -> tuple[int, int, int, int]:
         """
-        Upload new websites to Supabase, skipping duplicates.
+        Upload new rows to Supabase, skipping duplicates.
         
         Args:
-            websites: List of websites to upload
+            rows: List of row dictionaries with website, short_description, prompts
             existing_websites: Set of normalized existing websites
             
         Returns:
-            Tuple of (uploaded_count, skipped_count)
+            Tuple of (inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count)
         """
-        uploaded_count = 0
-        skipped_count = 0
-        new_websites = []
+        inserted_count = 0
+        skipped_blank_count = 0
+        skipped_duplicate_count = 0
+        failed_count = 0
+        new_rows = []
         
-        # Filter out duplicates
-        for website in websites:
+        # Check if prompts column exists
+        has_prompts = self.check_prompts_column()
+        
+        # Filter out duplicates and blank websites
+        for row in rows:
+            website = row['website']
+            
+            # Skip blank websites
+            if not website:
+                skipped_blank_count += 1
+                continue
+            
             normalized = self._normalize_website(website)
             
+            # Skip duplicates
             if normalized in existing_websites:
-                skipped_count += 1
+                skipped_duplicate_count += 1
             else:
-                new_websites.append({
-                    'website': website,
+                # Prepare insert data
+                insert_data = {
+                    'website': normalized,
+                    'short_description': row['short_description'],
                     'status': 'new'
-                })
+                }
+                
+                # Add prompts only if column exists and value is present
+                if has_prompts and row['prompts']:
+                    insert_data['prompts'] = row['prompts']
+                
+                new_rows.append(insert_data)
                 # Add to existing set to avoid duplicates within the same batch
                 existing_websites.add(normalized)
         
-        # Batch insert new websites
-        if new_websites:
+        # Batch insert new rows
+        if new_rows:
             try:
                 # Insert in batches to avoid payload size limits
                 batch_size = 100
-                for i in range(0, len(new_websites), batch_size):
-                    batch = new_websites[i:i + batch_size]
-                    response = (
-                        self.supabase.table('prospects')
-                        .insert(batch)
-                        .execute()
-                    )
-                    uploaded_count += len(batch)
-                    print(f"Uploaded batch: {len(batch)} websites (total: {uploaded_count})")
+                for i in range(0, len(new_rows), batch_size):
+                    batch = new_rows[i:i + batch_size]
+                    try:
+                        response = (
+                            self.supabase.table('prospects')
+                            .insert(batch)
+                            .execute()
+                        )
+                        inserted_count += len(batch)
+                        print(f"Uploaded batch: {len(batch)} rows (total: {inserted_count})")
+                    except Exception as e:
+                        # If error is about prompts column, retry without prompts
+                        error_str = str(e).lower()
+                        if has_prompts and 'prompts' in error_str and ('column' in error_str or 'does not exist' in error_str):
+                            # Retry batch without prompts
+                            self.has_prompts_column = False
+                            batch_without_prompts = []
+                            for item in batch:
+                                item_copy = item.copy()
+                                item_copy.pop('prompts', None)
+                                batch_without_prompts.append(item_copy)
+                            
+                            try:
+                                response = (
+                                    self.supabase.table('prospects')
+                                    .insert(batch_without_prompts)
+                                    .execute()
+                                )
+                                inserted_count += len(batch_without_prompts)
+                                print(f"Uploaded batch: {len(batch_without_prompts)} rows without prompts (total: {inserted_count})")
+                            except Exception as retry_error:
+                                print(f"Error uploading batch (retry without prompts): {str(retry_error)}")
+                                failed_count += len(batch)
+                        else:
+                            print(f"Error uploading batch: {str(e)}")
+                            failed_count += len(batch)
             except Exception as e:
-                print(f"Error uploading websites: {str(e)}")
-                # Return partial count if some were uploaded before error
-                return uploaded_count, skipped_count
+                print(f"Error during batch upload: {str(e)}")
+                failed_count += len(new_rows) - inserted_count
         
-        return uploaded_count, skipped_count
+        return inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count
     
     def run(self) -> None:
         """Main upload workflow execution."""
@@ -225,17 +318,18 @@ class CSVUploader:
             print(f"Error: {INPUT_CSV} not found in the current directory.")
             return
         
-        # Read websites from CSV
-        print(f"Reading websites from {INPUT_CSV}...")
+        # Read rows from CSV
+        print(f"Reading rows from {INPUT_CSV}...")
         try:
-            websites = self.read_csv_websites(INPUT_CSV)
-            print(f"Found {len(websites)} websites in CSV")
+            rows = self.read_csv_rows(INPUT_CSV)
+            rows_read = len(rows)
+            print(f"Found {rows_read} rows in CSV")
         except Exception as e:
             print(f"Error reading CSV: {str(e)}")
             return
         
-        if not websites:
-            print("No websites found in CSV file.")
+        if not rows:
+            print("No rows found in CSV file.")
             return
         
         print("-" * 50)
@@ -247,12 +341,17 @@ class CSVUploader:
         
         print("-" * 50)
         
-        # Upload new websites
-        print("Uploading new websites...")
-        uploaded_count, skipped_count = self.upload_websites(websites, existing_websites)
+        # Upload new rows
+        print("Uploading new rows...")
+        inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count = self.upload_rows(rows, existing_websites)
         
         print("-" * 50)
-        print(f"Uploaded {uploaded_count} new websites. Skipped {skipped_count} duplicates.")
+        print("Upload Summary:")
+        print(f"  Rows read: {rows_read}")
+        print(f"  Rows skipped (blank website): {skipped_blank_count}")
+        print(f"  Rows skipped (duplicates): {skipped_duplicate_count}")
+        print(f"  Rows inserted: {inserted_count}")
+        print(f"  Rows failed: {failed_count}")
         print("Upload workflow completed!")
 
 
