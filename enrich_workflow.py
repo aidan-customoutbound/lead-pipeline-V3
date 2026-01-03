@@ -36,7 +36,7 @@ STEP1_MODEL_PRIMARY = "google/gemini-2.5-flash"
 STEP1_MODEL_FALLBACK = "openai/gpt-5-mini"
 STEP1_TEMPERATURE = 0.3
 STEP1_MAX_TOKENS = 250
-STEP1_PROMPT_TEMPLATE = "If the website contains numbers, I want you to return an empty string. If the website does not contains numbers, I want you to return the word *numbers*. Here is the website: {website}"
+STEP1_PROMPT_TEMPLATE = "If the website contains numbers, I want you to return an empty string. If the website does not contains numbers, I want you to return the word *numbers*. Here is the website: {exa_summary}"
 
 # Step 2 Configuration
 STEP2_MODEL_PRIMARY = "google/gemini-2.5-flash"
