@@ -9,9 +9,10 @@ Production-ready version with batch processing for large datasets.
 
 import asyncio
 import os
+import re
 import time
 import uuid
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from exa_py import Exa
@@ -29,36 +30,14 @@ SEMAPHORE_LIMIT = 5  # Max concurrent requests (respects Exa's 10 QPS limit)
 BATCH_SIZE = 50  # Number of rows to fetch and process per batch
 RUN_CLEANING = False  # Enable/disable full-table cleaning phase
 
-# Multi-step AI Enrichment Configuration
-NUM_STEPS_TO_RUN = 2  # Number of enrichment steps to execute (expandable to 4)
+# Exa Configuration
+RUN_EXA = True  # Enable/disable Exa fetching (if False, Exa is never called)
 
-# Step 1 Configuration
-STEP1_MODEL_PRIMARY = "google/gemini-2.5-flash"
-STEP1_MODEL_FALLBACK = "openai/gpt-5-mini"
-STEP1_TEMPERATURE = 0.3
-STEP1_MAX_TOKENS = 250
-STEP1_PROMPT_TEMPLATE = "Give me a summary of this company: {exa_summary}"
-
-# Step 2 Configuration
-STEP2_MODEL_PRIMARY = "google/gemini-2.5-flash"
-STEP2_MODEL_FALLBACK = "openai/gpt-5-mini"
-STEP2_TEMPERATURE = 0.3
-STEP2_MAX_TOKENS = 250
-STEP2_PROMPT_TEMPLATE = "Given this company description: {exa_summary}. And this prior result: {step1_output}. Provide one sentence expanding on the category."
-
-# Step 3 Configuration (for future expansion)
-STEP3_MODEL_PRIMARY = "google/gemini-2.5-flash"
-STEP3_MODEL_FALLBACK = "openai/gpt-5-mini"
-STEP3_TEMPERATURE = 0.3
-STEP3_MAX_TOKENS = 250
-STEP3_PROMPT_TEMPLATE = "Is this company B2B or B2C?: {exa_summary}"
-
-# Step 4 Configuration (for future expansion)
-STEP4_MODEL_PRIMARY = "google/gemini-2.5-flash"
-STEP4_MODEL_FALLBACK = "openai/gpt-5-mini"
-STEP4_TEMPERATURE = 0.3
-STEP4_MAX_TOKENS = 250
-STEP4_PROMPT_TEMPLATE = "Generate a list of this companys services: {exa_summary}"
+# Default model configuration (used for all steps if prompts table doesn't specify)
+DEFAULT_MODEL_PRIMARY = "google/gemini-2.5-flash"
+DEFAULT_MODEL_FALLBACK = "openai/gpt-5-mini"
+DEFAULT_TEMPERATURE = 0.3
+DEFAULT_MAX_TOKENS = 250
 
 
 class EnrichmentWorkflow:
@@ -66,18 +45,31 @@ class EnrichmentWorkflow:
     
     def __init__(self):
         """Initialize global clients for Supabase, Exa.AI, and OpenRouter (reused across all batches)."""
-        if not all([SUPABASE_URL, SUPABASE_KEY, EXA_API_KEY, OPENROUTER_API_KEY]):
+        required_vars = [SUPABASE_URL, SUPABASE_KEY, OPENROUTER_API_KEY]
+        if RUN_EXA:
+            required_vars.append(EXA_API_KEY)
+        
+        if not all(required_vars):
+            missing = []
+            if not SUPABASE_URL:
+                missing.append("SUPABASE_URL")
+            if not SUPABASE_KEY:
+                missing.append("SUPABASE_KEY")
+            if not OPENROUTER_API_KEY:
+                missing.append("OPENROUTER_API_KEY")
+            if RUN_EXA and not EXA_API_KEY:
+                missing.append("EXA_API_KEY")
+            
             raise ValueError(
-                "Missing required environment variables. "
-                "Please check your .env file for: "
-                "SUPABASE_URL, SUPABASE_KEY, EXA_API_KEY, OPENROUTER_API_KEY"
+                f"Missing required environment variables: {', '.join(missing)}. "
+                "Please check your .env file."
             )
         
         # Initialize global Supabase client (reused across all batches)
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Initialize global Exa.AI client (reused across all batches)
-        self.exa = Exa(api_key=EXA_API_KEY)
+        # Initialize global Exa.AI client (reused across all batches) - only if RUN_EXA is True
+        self.exa = Exa(api_key=EXA_API_KEY) if RUN_EXA else None
         
         # Initialize global OpenRouter client (reused across all batches)
         # OpenRouter is OpenAI-compatible, so we use AsyncOpenAI with OpenRouter base URL
@@ -100,6 +92,14 @@ class EnrichmentWorkflow:
         self.db_write_retries = 0
         self.db_write_failures = 0
         self.exa_failures = 0
+        self.prompts_loaded_count = 0
+        self.prospects_skipped_summary_too_short = 0
+        self.steps_skipped_missing_placeholders = 0
+        self.prospects_skipped_missing_placeholders = 0
+        self.prospects_blocked_missing_placeholders = 0
+        
+        # Prompts loaded from database (list of prompt strings in order)
+        self.prompts: List[str] = []
         
         # Run ID for idempotency within this run
         self.run_id = None
@@ -151,6 +151,34 @@ class EnrichmentWorkflow:
         junk_phrases = ['not found', 'unreachable']
         
         return any(phrase in website_lower for phrase in junk_phrases)
+    
+    def fetch_prompts(self) -> List[str]:
+        """
+        Fetch active prompts from Supabase prompts table, ordered by step_order.
+        
+        Returns:
+            List of prompt strings in execution order
+        """
+        try:
+            response = (
+                self.supabase.table('prompts')
+                .select('step_order, prompt_text')
+                .eq('is_active', True)
+                .order('step_order', desc=False)
+                .execute()
+            )
+            
+            if not response.data:
+                return []
+            
+            # Extract prompt_text in order
+            prompts = [row['prompt_text'] for row in response.data]
+            self.prompts_loaded_count = len(prompts)
+            return prompts
+            
+        except Exception as e:
+            print(f"Error fetching prompts from Supabase: {str(e)}")
+            return []
     
     async def clean_data(self) -> None:
         """
@@ -386,6 +414,9 @@ class EnrichmentWorkflow:
         Returns:
             Summary string or None if error occurs
         """
+        if not RUN_EXA or not self.exa:
+            return None
+        
         try:
             # Ensure website has protocol
             if not website.startswith(('http://', 'https://')):
@@ -418,6 +449,105 @@ class EnrichmentWorkflow:
         except Exception as e:
             print(f"Error getting Exa summary for {website}: {str(e)}")
             return None
+    
+    def _extract_placeholders(self, prompt_template: str) -> List[str]:
+        """
+        Extract placeholder names from a prompt template.
+        
+        Args:
+            prompt_template: The prompt template string
+            
+        Returns:
+            List of placeholder names (without braces)
+        """
+        placeholders = re.findall(r'\{(\w+)\}', prompt_template)
+        return placeholders
+    
+    def _is_blank(self, value: Any) -> bool:
+        """
+        Check if a value is missing/blank.
+        
+        A placeholder value counts as missing if:
+        - It is None OR
+        - After converting to string and stripping whitespace, it is empty.
+        
+        Args:
+            value: The value to check
+            
+        Returns:
+            True if value is missing/blank, False otherwise
+        """
+        if value is None:
+            return True
+        if not isinstance(value, str):
+            value = str(value)
+        return not value.strip()
+    
+    def _build_company_summary(self, exa_summary: Optional[str], short_description: Optional[str]) -> str:
+        """
+        Build company_summary from exa_summary and short_description.
+        
+        Args:
+            exa_summary: Exa summary (may be None or empty)
+            short_description: Short description (may be None or empty)
+            
+        Returns:
+            Combined company_summary string
+        """
+        exa_part = (exa_summary or "").strip()
+        desc_part = (short_description or "").strip()
+        
+        if RUN_EXA and exa_part and desc_part:
+            return f"{exa_part} / {desc_part}"
+        elif RUN_EXA and exa_part:
+            return exa_part
+        elif desc_part:
+            return desc_part
+        else:
+            return ""
+    
+    def _format_prompt(self, prompt_template: str, variables: Dict[str, str]) -> str:
+        """
+        Format a prompt template with available variables, safely handling missing placeholders.
+        
+        Args:
+            prompt_template: The prompt template string
+            variables: Dictionary of variable names to values
+            
+        Returns:
+            Formatted prompt string
+        """
+        # Build a dict with all possible placeholders, defaulting to empty string
+        safe_vars = {
+            'company_summary': variables.get('company_summary', ''),
+            'exa_summary': variables.get('exa_summary', ''),
+            'short_description': variables.get('short_description', ''),
+            'step1_output': variables.get('step1_output', ''),
+            'step2_output': variables.get('step2_output', ''),
+            'step3_output': variables.get('step3_output', ''),
+            'step4_output': variables.get('step4_output', ''),
+            'step5_output': variables.get('step5_output', ''),
+        }
+        
+        # Check for any placeholders in the template that we don't support
+        import re
+        placeholders = re.findall(r'\{(\w+)\}', prompt_template)
+        for placeholder in placeholders:
+            if placeholder not in safe_vars:
+                print(f"  [WARNING] Prompt references unknown placeholder: {{{placeholder}}}")
+                # Add it as empty string to avoid KeyError
+                safe_vars[placeholder] = ''
+        
+        # Use safe formatting - if a placeholder is missing, treat as empty string
+        try:
+            return prompt_template.format(**safe_vars)
+        except (KeyError, ValueError) as e:
+            print(f"  [WARNING] Error formatting prompt: {str(e)}")
+            # Fallback: replace placeholders manually
+            formatted = prompt_template
+            for key, value in safe_vars.items():
+                formatted = formatted.replace(f'{{{key}}}', str(value))
+            return formatted
     
     async def _call_llm_with_retry(
         self,
@@ -503,71 +633,37 @@ class EnrichmentWorkflow:
     async def _run_enrichment_step(
         self,
         step_num: int,
-        exa_summary: str,
-        step_outputs: Dict[int, str]
+        prompt_template: str,
+        variables: Dict[str, str]
     ) -> Optional[str]:
         """
         Run a single enrichment step.
         
         Args:
-            step_num: Step number (1-4)
-            exa_summary: The Exa summary
-            step_outputs: Dictionary of previous step outputs (key: step_num, value: output)
+            step_num: Step number (1-based)
+            prompt_template: The prompt template string
+            variables: Dictionary of variables for prompt formatting
             
         Returns:
             Step output or None if failed
         """
-        # Get step configuration
-        config_map = {
-            1: {
-                'model_primary': STEP1_MODEL_PRIMARY,
-                'model_fallback': STEP1_MODEL_FALLBACK,
-                'temperature': STEP1_TEMPERATURE,
-                'max_tokens': STEP1_MAX_TOKENS,
-                'prompt_template': STEP1_PROMPT_TEMPLATE
-            },
-            2: {
-                'model_primary': STEP2_MODEL_PRIMARY,
-                'model_fallback': STEP2_MODEL_FALLBACK,
-                'temperature': STEP2_TEMPERATURE,
-                'max_tokens': STEP2_MAX_TOKENS,
-                'prompt_template': STEP2_PROMPT_TEMPLATE
-            },
-            3: {
-                'model_primary': STEP3_MODEL_PRIMARY,
-                'model_fallback': STEP3_MODEL_FALLBACK,
-                'temperature': STEP3_TEMPERATURE,
-                'max_tokens': STEP3_MAX_TOKENS,
-                'prompt_template': STEP3_PROMPT_TEMPLATE
-            },
-            4: {
-                'model_primary': STEP4_MODEL_PRIMARY,
-                'model_fallback': STEP4_MODEL_FALLBACK,
-                'temperature': STEP4_TEMPERATURE,
-                'max_tokens': STEP4_MAX_TOKENS,
-                'prompt_template': STEP4_PROMPT_TEMPLATE
-            }
-        }
+        # Format prompt with available variables
+        prompt = self._format_prompt(prompt_template, variables)
         
-        config = config_map[step_num]
-        
-        # Format prompt with placeholders
-        prompt = config['prompt_template'].format(
-            exa_summary=exa_summary,
-            step1_output=step_outputs.get(1, ''),
-            step2_output=step_outputs.get(2, ''),
-            step3_output=step_outputs.get(3, ''),
-            step4_output=step_outputs.get(4, '')
-        )
+        # Use default model configuration
+        model_primary = DEFAULT_MODEL_PRIMARY
+        model_fallback = DEFAULT_MODEL_FALLBACK
+        temperature = DEFAULT_TEMPERATURE
+        max_tokens = DEFAULT_MAX_TOKENS
         
         # Call LLM with retry
         return await self._call_llm_with_retry(
             step_num=step_num,
             prompt=prompt,
-            model_primary=config['model_primary'],
-            model_fallback=config['model_fallback'],
-            temperature=config['temperature'],
-            max_tokens=config['max_tokens']
+            model_primary=model_primary,
+            model_fallback=model_fallback,
+            temperature=temperature,
+            max_tokens=max_tokens
         )
     
     async def _verify_write(
@@ -589,7 +685,7 @@ class EnrichmentWorkflow:
             def read_prospect():
                 return (
                     self.supabase.table('prospects')
-                    .select('id, status, exa_summary, step1_output, step2_output, step3_output, step4_output')
+                    .select('id, status, exa_summary, company_summary, step1_output, step2_output, step3_output, step4_output, step5_output')
                     .eq('id', prospect_id)
                     .execute()
                 )
@@ -611,8 +707,13 @@ class EnrichmentWorkflow:
                 if row.get('exa_summary') != expected_data['exa_summary']:
                     return False
             
-            # Verify step outputs
-            for step_num in range(1, NUM_STEPS_TO_RUN + 1):
+            # Verify company_summary
+            if 'company_summary' in expected_data and expected_data['company_summary'] is not None:
+                if row.get('company_summary') != expected_data['company_summary']:
+                    return False
+            
+            # Verify step outputs (check up to step5)
+            for step_num in range(1, 6):
                 step_key = f'step{step_num}_output'
                 if step_key in expected_data:
                     if row.get(step_key) != expected_data[step_key]:
@@ -627,8 +728,11 @@ class EnrichmentWorkflow:
         self,
         prospect_id: Any,
         exa_summary: Optional[str],
+        company_summary: str,
         step_outputs: Dict[int, str],
-        db_write_semaphore: asyncio.Semaphore
+        status: str,
+        db_write_semaphore: asyncio.Semaphore,
+        blocked_reason: Optional[str] = None
     ) -> bool:
         """
         Write prospect data to Supabase with retry logic and verification.
@@ -636,8 +740,11 @@ class EnrichmentWorkflow:
         Args:
             prospect_id: The ID of the prospect to update
             exa_summary: The summary from Exa.AI (can be None)
+            company_summary: The computed company_summary
             step_outputs: Dictionary of step outputs (key: step_num, value: output)
+            status: Status to set ('enriched', 'skipped', or 'blocked')
             db_write_semaphore: Semaphore to serialize DB writes (concurrency=1)
+            blocked_reason: Optional reason for blocking (only used if status='blocked')
             
         Returns:
             True if write succeeded and was verified, False otherwise
@@ -646,16 +753,24 @@ class EnrichmentWorkflow:
             self.db_writes_attempted += 1
             
             # Build update data
-            update_data = {'status': 'enriched'}
+            update_data = {
+                'status': status,
+                'company_summary': company_summary
+            }
             
             if exa_summary is not None:
                 update_data['exa_summary'] = exa_summary
             
-            # Only include step outputs for required steps (1..NUM_STEPS_TO_RUN)
-            for step_num in range(1, NUM_STEPS_TO_RUN + 1):
+            # Include step outputs (support up to step5)
+            # Only write non-blank step outputs to avoid overwriting existing data
+            for step_num in range(1, 6):
                 step_key = f'step{step_num}_output'
                 if step_num in step_outputs and step_outputs[step_num]:
                     update_data[step_key] = step_outputs[step_num]
+            
+            # Optionally include blocked_reason if provided (column may not exist)
+            if blocked_reason is not None:
+                update_data['blocked_reason'] = blocked_reason
             
             # Retry logic with linear backoff (1s, 2s, 3s)
             max_retries = 3
@@ -691,6 +806,16 @@ class EnrichmentWorkflow:
                             return False
                 
                 except Exception as e:
+                    error_str = str(e).lower()
+                    # If blocked_reason column doesn't exist, retry without it
+                    if blocked_reason is not None and ('column' in error_str or 'field' in error_str or 'does not exist' in error_str):
+                        if attempt == 0:
+                            # Remove blocked_reason and retry
+                            update_data_without_reason = {k: v for k, v in update_data.items() if k != 'blocked_reason'}
+                            update_data = update_data_without_reason
+                            print(f"  [DB WRITE] Prospect {prospect_id} (run_id: {self.run_id}): blocked_reason column not found, retrying without it...")
+                            continue
+                    
                     print(f"  [DB WRITE] Prospect {prospect_id} (run_id: {self.run_id}): Write attempt {attempt + 1} failed: {str(e)}")
                     if attempt == max_retries - 1:
                         self.db_write_failures += 1
@@ -729,11 +854,22 @@ class EnrichmentWorkflow:
             print(f"  [SKIP] Prospect {prospect_id} (normalized: {normalized_website}, run_id: {self.run_id}): Already failed in this run, skipping")
             return
         
+        # Get existing data
+        existing_exa_summary = prospect.get('exa_summary')
+        short_description = prospect.get('short_description')
+        
+        # Get existing step outputs
+        existing_step_outputs = {}
+        for step in range(1, 6):
+            step_key = f'step{step}_output'
+            if step_key in prospect and prospect[step_key]:
+                existing_step_outputs[step] = prospect[step_key]
+        
         # Check if prospect is eligible (has at least one blank required step)
+        num_prompts = len(self.prompts)
         has_blank_step = False
-        for step_num in range(1, NUM_STEPS_TO_RUN + 1):
-            step_key = f'step{step_num}_output'
-            if step_key not in prospect or not prospect[step_key]:
+        for step_num in range(1, num_prompts + 1):
+            if step_num not in existing_step_outputs or not existing_step_outputs[step_num]:
                 has_blank_step = True
                 break
         
@@ -744,51 +880,111 @@ class EnrichmentWorkflow:
         async with ai_semaphore:
             # In-memory cache for AI results
             cached_exa_summary: Optional[str] = None
+            cached_company_summary: str = ""
             cached_step_outputs: Dict[int, str] = {}
             
             try:
-                # Get existing step outputs from prospect data
-                for step in range(1, 5):
-                    step_key = f'step{step}_output'
-                    if step_key in prospect and prospect[step_key]:
-                        cached_step_outputs[step] = prospect[step_key]
+                # Copy existing step outputs
+                cached_step_outputs = existing_step_outputs.copy()
                 
-                # REQUIRE EXA SUMMARY BEFORE STEP 1
-                # Get Exa summary (use existing if available and non-empty, otherwise fetch)
-                existing_exa_summary = prospect.get('exa_summary')
-                if existing_exa_summary and existing_exa_summary.strip():
-                    cached_exa_summary = existing_exa_summary
+                # STEP 1: Get Exa summary (if RUN_EXA is True)
+                if RUN_EXA:
+                    if existing_exa_summary and existing_exa_summary.strip():
+                        # Reuse existing Exa summary
+                        cached_exa_summary = existing_exa_summary
+                    else:
+                        # Fetch Exa summary (attempt once, no retries)
+                        cached_exa_summary = await self.get_exa_summary(website)
+                        # If Exa fails, accept it and proceed (do not mark as failed)
+                        if not cached_exa_summary or not cached_exa_summary.strip():
+                            print(f"  [EXA] No summary found for {website} (ID: {prospect_id}, run_id: {self.run_id}) - proceeding without Exa")
+                            self.exa_failures += 1
+                            cached_exa_summary = None
                 else:
-                    # Fetch Exa summary
-                    cached_exa_summary = await self.get_exa_summary(website)
+                    cached_exa_summary = None
                 
-                # If Exa summary is still empty/None after fetch, this is a final failure
-                if not cached_exa_summary or not cached_exa_summary.strip():
-                    print(f"  [EXA FAILURE] No summary found for {website} (ID: {prospect_id}, normalized: {normalized_website}, run_id: {self.run_id})")
-                    self.exa_failures += 1
-                    failed_this_run.add(normalized_website)
+                # STEP 2: Build company_summary
+                cached_company_summary = self._build_company_summary(cached_exa_summary, short_description)
+                
+                # STEP 3: Check company_summary length gate
+                if not cached_company_summary or len(cached_company_summary) <= 50:
+                    # Skip this prospect - company_summary too short
+                    print(f"  [SKIP] Prospect {prospect_id} (run_id: {self.run_id}): company_summary too short (length: {len(cached_company_summary)})")
+                    self.prospects_skipped_summary_too_short += 1
+                    
+                    # Write skipped status with company_summary and exa_summary
+                    write_success = await self._write_prospect_with_retry(
+                        prospect_id,
+                        cached_exa_summary,
+                        cached_company_summary,
+                        {},
+                        'skipped',
+                        db_write_semaphore
+                    )
+                    
+                    if not write_success:
+                        print(f"  [ERROR] Failed to write skipped status for prospect {prospect_id}")
+                        failed_this_run.add(normalized_website)
+                    
                     return
                 
-                # Run all required enrichment steps sequentially, caching outputs in memory
-                for step_num in range(1, NUM_STEPS_TO_RUN + 1):
+                # STEP 4: Run all required enrichment steps sequentially, caching outputs in memory
+                num_prompts = len(self.prompts)
+                
+                for step_num in range(1, num_prompts + 1):
                     # Skip if this step already has output
                     if step_num in cached_step_outputs and cached_step_outputs[step_num]:
                         continue
                     
-                    # Ensure all previous required steps have outputs
-                    all_previous_complete = True
-                    for prev_step in range(1, step_num):
-                        if prev_step not in cached_step_outputs or not cached_step_outputs[prev_step]:
-                            all_previous_complete = False
-                            break
+                    # Build variables dict for prompt formatting
+                    variables = {
+                        'company_summary': cached_company_summary,
+                        'exa_summary': cached_exa_summary or '',
+                        'short_description': short_description or '',
+                    }
                     
-                    if not all_previous_complete:
-                        print(f"  [ERROR] Prospect {prospect_id} (run_id: {self.run_id}): Step {step_num} cannot run - previous steps incomplete")
-                        failed_this_run.add(normalized_website)
+                    # Add prior step outputs
+                    for prev_step in range(1, step_num):
+                        variables[f'step{prev_step}_output'] = cached_step_outputs.get(prev_step, '')
+                    
+                    # Get prompt template for this step
+                    prompt_template = self.prompts[step_num - 1]  # 0-indexed
+                    
+                    # Check for missing placeholders before calling LLM
+                    placeholders = self._extract_placeholders(prompt_template)
+                    missing_placeholders = []
+                    
+                    for placeholder in placeholders:
+                        placeholder_value = variables.get(placeholder)
+                        if self._is_blank(placeholder_value):
+                            missing_placeholders.append(placeholder)
+                    
+                    if missing_placeholders:
+                        # IMMEDIATE BLOCKING: Missing placeholders detected for a required step
+                        # Do NOT call the LLM - block the prospect immediately
+                        self.prospects_blocked_missing_placeholders += 1
+                        print(f"  [BLOCKED] Prospect {prospect_id} (run_id: {self.run_id}) website={normalized_website} step={step_num} missing={','.join(missing_placeholders)}")
+                        
+                        # Persist blocked status to DB immediately
+                        # Pass empty step_outputs dict to preserve existing outputs
+                        write_success = await self._write_prospect_with_retry(
+                            prospect_id,
+                            cached_exa_summary,
+                            cached_company_summary,
+                            {},  # Empty dict - do not overwrite existing step outputs
+                            'blocked',
+                            db_write_semaphore
+                        )
+                        
+                        if not write_success:
+                            print(f"  [ERROR] Failed to write blocked status for prospect {prospect_id}")
+                            # Even if write fails, we still exit (don't retry infinitely)
+                        
+                        # Exit processing for this prospect (no further steps attempted)
                         return
                     
                     # Run the step
-                    step_result = await self._run_enrichment_step(step_num, cached_exa_summary, cached_step_outputs)
+                    step_result = await self._run_enrichment_step(step_num, prompt_template, variables)
                     
                     if not step_result:
                         # Step failed after all retries - this is a final failure
@@ -799,23 +995,13 @@ class EnrichmentWorkflow:
                     # Store the result in memory cache
                     cached_step_outputs[step_num] = step_result
                 
-                # Verify all required steps are complete
-                all_steps_complete = True
-                for step_num in range(1, NUM_STEPS_TO_RUN + 1):
-                    if step_num not in cached_step_outputs or not cached_step_outputs[step_num]:
-                        all_steps_complete = False
-                        break
-                
-                if not all_steps_complete:
-                    print(f"  [ERROR] Prospect {prospect_id} (run_id: {self.run_id}): Not all required steps completed")
-                    failed_this_run.add(normalized_website)
-                    return
-                
                 # All steps succeeded - perform single final write to Supabase
                 write_success = await self._write_prospect_with_retry(
                     prospect_id,
                     cached_exa_summary,
+                    cached_company_summary,
                     cached_step_outputs,
+                    'enriched',
                     db_write_semaphore
                 )
                 
@@ -823,6 +1009,7 @@ class EnrichmentWorkflow:
                     self.prospects_enriched += 1
                     # Immediately discard cached data (memory safety)
                     cached_exa_summary = None
+                    cached_company_summary = ""
                     cached_step_outputs = {}
                 else:
                     # DB write failed after all retries - this is a final failure
@@ -831,6 +1018,7 @@ class EnrichmentWorkflow:
                     failed_this_run.add(normalized_website)
                     # Discard cached data even on failure (memory safety)
                     cached_exa_summary = None
+                    cached_company_summary = ""
                     cached_step_outputs = {}
                 
             except Exception as e:
@@ -839,6 +1027,7 @@ class EnrichmentWorkflow:
                 failed_this_run.add(normalized_website)
                 # Discard cached data on error (memory safety)
                 cached_exa_summary = None
+                cached_company_summary = ""
                 cached_step_outputs = {}
     
     def fetch_batch(self, limit: int = BATCH_SIZE) -> list:
@@ -855,7 +1044,7 @@ class EnrichmentWorkflow:
         try:
             response = (
                 self.supabase.table('prospects')
-                .select('id, website, exa_summary, step1_output, step2_output, step3_output, step4_output')
+                .select('id, website, short_description, exa_summary, company_summary, step1_output, step2_output, step3_output, step4_output, step5_output')
                 .eq('status', 'new')
                 .limit(limit)
                 .execute()
@@ -885,30 +1074,45 @@ class EnrichmentWorkflow:
         print("=" * 60)
         
         # Test Supabase connection first
-        print("\n[1/4] Testing Supabase connection...")
+        print("\n[1/5] Testing Supabase connection...")
         connection_ok = await self.test_supabase_connection()
         if not connection_ok:
             print("Cannot proceed without a valid Supabase connection.")
             return
         
-        print("\n[2/4] Initializing clients...")
+        # Fetch prompts from database
+        print("\n[2/5] Fetching prompts from database...")
+        self.prompts = self.fetch_prompts()
+        if not self.prompts:
+            print("ERROR: No active prompts found in database. Cannot proceed.")
+            print("Please ensure the 'prompts' table has at least one row with is_active=true.")
+            return
+        
+        print(f"  ✓ Loaded {len(self.prompts)} active prompts")
+        for i, prompt in enumerate(self.prompts, 1):
+            print(f"    Step {i}: {prompt[:80]}..." if len(prompt) > 80 else f"    Step {i}: {prompt}")
+        
+        print("\n[3/5] Initializing clients...")
         print(f"  ✓ Supabase client initialized")
-        print(f"  ✓ Exa.AI client initialized")
+        if RUN_EXA:
+            print(f"  ✓ Exa.AI client initialized")
+        else:
+            print(f"  ⚠ Exa.AI disabled (RUN_EXA=False)")
         print(f"  ✓ OpenRouter client initialized")
         print(f"  ✓ AI Semaphore limit: {SEMAPHORE_LIMIT} concurrent requests")
         print(f"  ✓ DB Write Semaphore: 1 (serialized writes)")
         print(f"  ✓ Batch size: {BATCH_SIZE} rows per batch")
-        print(f"  ✓ Number of enrichment steps: {NUM_STEPS_TO_RUN}")
+        print(f"  ✓ Number of enrichment steps: {len(self.prompts)}")
         
         # Data cleaning phase
-        print("\n[3/4] Data cleaning phase...")
+        print("\n[4/5] Data cleaning phase...")
         if RUN_CLEANING:
             print("Cleaning enabled: running clean_data()")
             await self.clean_data()
         else:
             print("Cleaning disabled: skipping clean_data()")
         
-        print("\n[4/4] Starting batch processing...")
+        print("\n[5/5] Starting batch processing...")
         print("-" * 60)
         
         # Create semaphores
@@ -997,6 +1201,11 @@ class EnrichmentWorkflow:
         print(f"prospects_seen: {self.prospects_seen}")
         print(f"prospects_enriched: {self.prospects_enriched}")
         print(f"prospects_deferred_db_write: {self.prospects_deferred_db_write}")
+        print(f"prospects_skipped_summary_too_short: {self.prospects_skipped_summary_too_short}")
+        print(f"prospects_blocked_missing_placeholders: {self.prospects_blocked_missing_placeholders}")
+        print(f"steps_skipped_missing_placeholders: {self.steps_skipped_missing_placeholders}")
+        print(f"prospects_skipped_missing_placeholders: {self.prospects_skipped_missing_placeholders}")
+        print(f"prompts_loaded_count: {self.prompts_loaded_count}")
         print(f"exa_failures: {self.exa_failures}")
         print(f"ai_calls_attempted: {self.ai_calls_attempted}")
         print(f"ai_calls_retried: {self.ai_calls_retried}")
