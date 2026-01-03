@@ -36,7 +36,7 @@ STEP1_MODEL_PRIMARY = "google/gemini-2.5-flash"
 STEP1_MODEL_FALLBACK = "openai/gpt-5-mini"
 STEP1_TEMPERATURE = 0.3
 STEP1_MAX_TOKENS = 250
-STEP1_PROMPT_TEMPLATE = "If the website contains numbers, I want you to return an empty string. If the website does not contains numbers, I want you to return the word *numbers*. Here is the website: {exa_summary}"
+STEP1_PROMPT_TEMPLATE = "Give me a summary of this company: {exa_summary}"
 
 # Step 2 Configuration
 STEP2_MODEL_PRIMARY = "google/gemini-2.5-flash"
@@ -98,6 +98,7 @@ class EnrichmentWorkflow:
         self.db_writes_attempted = 0
         self.db_write_retries = 0
         self.db_write_failures = 0
+        self.exa_failures = 0
         
         # Run ID for idempotency within this run
         self.run_id = None
@@ -700,7 +701,8 @@ class EnrichmentWorkflow:
         self,
         prospect: Dict[str, Any],
         ai_semaphore: asyncio.Semaphore,
-        db_write_semaphore: asyncio.Semaphore
+        db_write_semaphore: asyncio.Semaphore,
+        failed_this_run: set
     ) -> None:
         """
         Enrich a single prospect with Exa summary and multi-step OpenRouter enrichment.
@@ -710,10 +712,21 @@ class EnrichmentWorkflow:
             prospect: Dictionary containing prospect data (must have 'id' and 'website' fields)
             ai_semaphore: Semaphore to limit concurrent AI requests
             db_write_semaphore: Semaphore to serialize DB writes (concurrency=1)
+            failed_this_run: Set of normalized websites that have failed in this run
         """
         self.prospects_seen += 1
         prospect_id = prospect.get('id')
         website = prospect.get('website')
+        
+        if not website:
+            print(f"  [ERROR] Prospect {prospect_id} (run_id: {self.run_id}) has no website")
+            return
+        
+        # Check if this prospect's normalized website has already failed in this run
+        normalized_website = self._normalize_website(website)
+        if normalized_website in failed_this_run:
+            print(f"  [SKIP] Prospect {prospect_id} (normalized: {normalized_website}, run_id: {self.run_id}): Already failed in this run, skipping")
+            return
         
         # Check if prospect is eligible (has at least one blank required step)
         has_blank_step = False
@@ -728,10 +741,6 @@ class EnrichmentWorkflow:
             return
         
         async with ai_semaphore:
-            if not website:
-                print(f"  [ERROR] Prospect {prospect_id} (run_id: {self.run_id}) has no website")
-                return
-            
             # In-memory cache for AI results
             cached_exa_summary: Optional[str] = None
             cached_step_outputs: Dict[int, str] = {}
@@ -743,14 +752,20 @@ class EnrichmentWorkflow:
                     if step_key in prospect and prospect[step_key]:
                         cached_step_outputs[step] = prospect[step_key]
                 
-                # Get Exa summary (use existing if available, otherwise fetch)
-                if prospect.get('exa_summary'):
-                    cached_exa_summary = prospect['exa_summary']
+                # REQUIRE EXA SUMMARY BEFORE STEP 1
+                # Get Exa summary (use existing if available and non-empty, otherwise fetch)
+                existing_exa_summary = prospect.get('exa_summary')
+                if existing_exa_summary and existing_exa_summary.strip():
+                    cached_exa_summary = existing_exa_summary
                 else:
+                    # Fetch Exa summary
                     cached_exa_summary = await self.get_exa_summary(website)
                 
-                if not cached_exa_summary:
-                    print(f"  [ERROR] No summary found for {website} (ID: {prospect_id}, run_id: {self.run_id})")
+                # If Exa summary is still empty/None after fetch, this is a final failure
+                if not cached_exa_summary or not cached_exa_summary.strip():
+                    print(f"  [EXA FAILURE] No summary found for {website} (ID: {prospect_id}, normalized: {normalized_website}, run_id: {self.run_id})")
+                    self.exa_failures += 1
+                    failed_this_run.add(normalized_website)
                     return
                 
                 # Run all required enrichment steps sequentially, caching outputs in memory
@@ -768,13 +783,16 @@ class EnrichmentWorkflow:
                     
                     if not all_previous_complete:
                         print(f"  [ERROR] Prospect {prospect_id} (run_id: {self.run_id}): Step {step_num} cannot run - previous steps incomplete")
+                        failed_this_run.add(normalized_website)
                         return
                     
                     # Run the step
                     step_result = await self._run_enrichment_step(step_num, cached_exa_summary, cached_step_outputs)
                     
                     if not step_result:
-                        print(f"  [ERROR] Prospect {prospect_id} (run_id: {self.run_id}): Step {step_num} failed")
+                        # Step failed after all retries - this is a final failure
+                        print(f"  [ERROR] Prospect {prospect_id} (normalized: {normalized_website}, run_id: {self.run_id}): Step {step_num} failed after all retries")
+                        failed_this_run.add(normalized_website)
                         return
                     
                     # Store the result in memory cache
@@ -789,6 +807,7 @@ class EnrichmentWorkflow:
                 
                 if not all_steps_complete:
                     print(f"  [ERROR] Prospect {prospect_id} (run_id: {self.run_id}): Not all required steps completed")
+                    failed_this_run.add(normalized_website)
                     return
                 
                 # All steps succeeded - perform single final write to Supabase
@@ -805,15 +824,18 @@ class EnrichmentWorkflow:
                     cached_exa_summary = None
                     cached_step_outputs = {}
                 else:
+                    # DB write failed after all retries - this is a final failure
                     self.prospects_deferred_db_write += 1
-                    print(f"  [DEFERRED] Prospect {prospect_id} (run_id: {self.run_id}): All retries failed. Row remains status='new' for next run.")
+                    print(f"  [DEFERRED] Prospect {prospect_id} (normalized: {normalized_website}, run_id: {self.run_id}): All retries failed. Row remains status='new' for next run.")
+                    failed_this_run.add(normalized_website)
                     # Discard cached data even on failure (memory safety)
                     cached_exa_summary = None
                     cached_step_outputs = {}
                 
             except Exception as e:
-                # Catch any unexpected errors
-                print(f"  [ERROR] Unexpected error processing prospect {prospect_id} ({website}, run_id: {self.run_id}): {str(e)}")
+                # Catch any unexpected errors - treat as final failure
+                print(f"  [ERROR] Unexpected error processing prospect {prospect_id} ({website}, normalized: {normalized_website}, run_id: {self.run_id}): {str(e)}")
+                failed_this_run.add(normalized_website)
                 # Discard cached data on error (memory safety)
                 cached_exa_summary = None
                 cached_step_outputs = {}
@@ -890,6 +912,9 @@ class EnrichmentWorkflow:
         # DB write semaphore with concurrency=1 (serialized writes)
         db_write_semaphore = asyncio.Semaphore(1)
         
+        # Initialize failed_this_run set to track normalized websites that have failed in this run
+        failed_this_run = set()
+        
         # Batch processing loop
         total_processed = 0
         batch_number = 0
@@ -906,19 +931,39 @@ class EnrichmentWorkflow:
                 print(f"[Batch {batch_number}] No more prospects to process. Job complete!")
                 break
             
-            print(f"[Batch {batch_number}] Fetched {len(batch)} prospects. Processing...")
+            # Filter out prospects whose normalized website is already in failed_this_run
+            filtered_batch = []
+            skipped_count = 0
+            for prospect in batch:
+                website = prospect.get('website', '')
+                normalized_website = self._normalize_website(website)
+                if normalized_website in failed_this_run:
+                    skipped_count += 1
+                    prospect_id = prospect.get('id')
+                    print(f"  [SKIP] Prospect {prospect_id} (normalized: {normalized_website}, run_id: {self.run_id}): Already failed in this run, skipping")
+                else:
+                    filtered_batch.append(prospect)
+            
+            if skipped_count > 0:
+                print(f"[Batch {batch_number}] Skipped {skipped_count} prospects already failed in this run")
+            
+            if not filtered_batch:
+                print(f"[Batch {batch_number}] All prospects in batch were skipped. Fetching next batch...")
+                continue
+            
+            print(f"[Batch {batch_number}] Processing {len(filtered_batch)} prospects (skipped {skipped_count})...")
             
             # Process this batch concurrently with AI semaphore
             tasks = [
-                self.enrich_prospect(prospect, ai_semaphore, db_write_semaphore)
-                for prospect in batch
+                self.enrich_prospect(prospect, ai_semaphore, db_write_semaphore, failed_this_run)
+                for prospect in filtered_batch
             ]
             
             # Wait for all tasks in this batch to complete
             await asyncio.gather(*tasks)
             
-            total_processed += len(batch)
-            print(f"[Batch {batch_number}] Batch Complete: {len(batch)} rows processed (Total: {total_processed})")
+            total_processed += len(filtered_batch)
+            print(f"[Batch {batch_number}] Batch Complete: {len(filtered_batch)} rows processed (Total: {total_processed})")
         
         # Capture end time at the very end
         end_time = time.time()
@@ -947,6 +992,7 @@ class EnrichmentWorkflow:
         print(f"prospects_seen: {self.prospects_seen}")
         print(f"prospects_enriched: {self.prospects_enriched}")
         print(f"prospects_deferred_db_write: {self.prospects_deferred_db_write}")
+        print(f"exa_failures: {self.exa_failures}")
         print(f"ai_calls_attempted: {self.ai_calls_attempted}")
         print(f"ai_calls_retried: {self.ai_calls_retried}")
         print(f"db_writes_attempted: {self.db_writes_attempted}")
