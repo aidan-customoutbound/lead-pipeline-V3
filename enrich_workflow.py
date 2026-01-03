@@ -29,7 +29,7 @@ SEMAPHORE_LIMIT = 5  # Max concurrent requests (respects Exa's 10 QPS limit)
 BATCH_SIZE = 50  # Number of rows to fetch and process per batch
 
 # Multi-step AI Enrichment Configuration
-NUM_STEPS_TO_RUN = 1  # Number of enrichment steps to execute (expandable to 4)
+NUM_STEPS_TO_RUN = 2  # Number of enrichment steps to execute (expandable to 4)
 
 # Step 1 Configuration
 STEP1_MODEL_PRIMARY = "google/gemini-2.5-flash"
