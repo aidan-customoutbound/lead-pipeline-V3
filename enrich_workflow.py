@@ -29,14 +29,14 @@ SEMAPHORE_LIMIT = 5  # Max concurrent requests (respects Exa's 10 QPS limit)
 BATCH_SIZE = 50  # Number of rows to fetch and process per batch
 
 # Multi-step AI Enrichment Configuration
-NUM_STEPS_TO_RUN = 4  # Number of enrichment steps to execute (expandable to 4)
+NUM_STEPS_TO_RUN = 1  # Number of enrichment steps to execute (expandable to 4)
 
 # Step 1 Configuration
 STEP1_MODEL_PRIMARY = "google/gemini-2.5-flash"
 STEP1_MODEL_FALLBACK = "openai/gpt-5-mini"
 STEP1_TEMPERATURE = 0.3
 STEP1_MAX_TOKENS = 250
-STEP1_PROMPT_TEMPLATE = "In 2 words tell me what kind of company this is based on the description: {exa_summary}"
+STEP1_PROMPT_TEMPLATE = "If the website contains numbers, I want you to return an empty string. If the website does not contains numbers, I want you to return the word *numbers*. Here is the website: {website}"
 
 # Step 2 Configuration
 STEP2_MODEL_PRIMARY = "google/gemini-2.5-flash"
