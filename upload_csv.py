@@ -258,6 +258,39 @@ class CSVUploader:
         
         return normalized
     
+    def _is_exa_blank(self, exa_value: str) -> bool:
+        """
+        Check if Exa value is blank.
+        
+        Blank means:
+        1) empty string ""
+        2) whitespace-only
+        3) case-insensitive exact match of "NULL"
+        4) case-insensitive exact match of "N/A"
+        
+        Args:
+            exa_value: The Exa value to check
+            
+        Returns:
+            True if blank, False otherwise
+        """
+        if not exa_value:
+            return True
+        
+        # Strip whitespace
+        stripped = exa_value.strip()
+        
+        # Check for empty or whitespace-only
+        if not stripped:
+            return True
+        
+        # Check for case-insensitive "NULL" or "N/A"
+        stripped_lower = stripped.lower()
+        if stripped_lower == "null" or stripped_lower == "n/a":
+            return True
+        
+        return False
+    
     def read_csv_rows(self, csv_path: str) -> List[Dict[str, str]]:
         """
         Read rows from CSV file with new format.
@@ -266,7 +299,7 @@ class CSVUploader:
             csv_path: Path to the CSV file
             
         Returns:
-            List of dictionaries with 'website', 'short_description' keys
+            List of dictionaries with 'website', 'short_description', 'exa' keys
         """
         rows = []
         
@@ -290,10 +323,12 @@ class CSVUploader:
                 for row_num, row in enumerate(reader, start=2):  # Start at 2 (header is row 1)
                     website = row.get('Website', '').strip()
                     short_description = row.get('Short Description', '').strip()
+                    exa = row.get('Exa', '').strip() if 'Exa' in row else ''
                     
                     rows.append({
                         'website': website,
-                        'short_description': short_description if short_description else None
+                        'short_description': short_description if short_description else None,
+                        'exa': exa
                     })
             
             return rows
@@ -302,24 +337,28 @@ class CSVUploader:
         except Exception as e:
             raise Exception(f"Error reading CSV file: {str(e)}")
     
-    def upload_rows(self, rows: List[Dict[str, str]], existing_websites: Set[str]) -> tuple[int, int, int, int]:
+    def upload_rows(self, rows: List[Dict[str, str]], existing_websites: Set[str]) -> tuple[int, int, int, int, int, int]:
         """
         Upload new rows to Supabase, skipping duplicates.
+        Also updates existing rows with exa_summary if CSV Exa is non-blank.
         
         Args:
-            rows: List of row dictionaries with website, short_description
+            rows: List of row dictionaries with website, short_description, exa
             existing_websites: Set of normalized existing websites
             
         Returns:
-            Tuple of (inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count)
+            Tuple of (inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count, exa_overwrites_applied, exa_values_used_for_new_rows)
         """
         inserted_count = 0
         skipped_blank_count = 0
         skipped_duplicate_count = 0
         failed_count = 0
+        exa_overwrites_applied = 0
+        exa_values_used_for_new_rows = 0
         new_rows = []
+        updates_to_apply = []  # List of (normalized_website, exa_summary) tuples
         
-        # Filter out duplicates and blank websites
+        # Filter out duplicates and blank websites, collect Exa updates
         for row in rows:
             website = row['website']
             
@@ -329,10 +368,20 @@ class CSVUploader:
                 continue
             
             normalized = self._normalize_website(website)
+            exa_value = row.get('exa', '')
             
-            # Skip duplicates
+            # Check if Exa is non-blank
+            exa_is_blank = self._is_exa_blank(exa_value)
+            exa_summary = None
+            if not exa_is_blank:
+                exa_summary = exa_value.strip()
+            
+            # Check if this is a duplicate
             if normalized in existing_websites:
                 skipped_duplicate_count += 1
+                # If Exa is non-blank, schedule an update for this existing row
+                if not exa_is_blank:
+                    updates_to_apply.append((normalized, exa_summary))
             else:
                 # Prepare insert data
                 insert_data = {
@@ -341,9 +390,30 @@ class CSVUploader:
                     'status': 'new'
                 }
                 
+                # Include exa_summary if Exa is non-blank
+                if not exa_is_blank:
+                    insert_data['exa_summary'] = exa_summary
+                    exa_values_used_for_new_rows += 1
+                
                 new_rows.append(insert_data)
                 # Add to existing set to avoid duplicates within the same batch
                 existing_websites.add(normalized)
+        
+        # Apply updates to existing rows with non-blank Exa
+        if updates_to_apply:
+            print(f"Applying {len(updates_to_apply)} Exa overwrites to existing rows...")
+            for normalized_website, exa_summary in updates_to_apply:
+                try:
+                    # Update the existing row by normalized website
+                    response = (
+                        self.supabase.table('prospects')
+                        .update({'exa_summary': exa_summary})
+                        .eq('website', normalized_website)
+                        .execute()
+                    )
+                    exa_overwrites_applied += 1
+                except Exception as e:
+                    print(f"Error updating exa_summary for {normalized_website}: {str(e)}")
         
         # Batch insert new rows
         if new_rows:
@@ -367,7 +437,7 @@ class CSVUploader:
                 print(f"Error during batch upload: {str(e)}")
                 failed_count += len(new_rows) - inserted_count
         
-        return inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count
+        return inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count, exa_overwrites_applied, exa_values_used_for_new_rows
     
     def run(self) -> None:
         """Main upload workflow execution."""
@@ -437,7 +507,7 @@ class CSVUploader:
         
         # Upload new rows
         print("Uploading new rows...")
-        inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count = self.upload_rows(rows, existing_websites)
+        inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count, exa_overwrites_applied, exa_values_used_for_new_rows = self.upload_rows(rows, existing_websites)
         
         print("-" * 50)
         print("Upload Summary:")
@@ -446,6 +516,8 @@ class CSVUploader:
         print(f"  Rows skipped (duplicates): {skipped_duplicate_count}")
         print(f"  Rows inserted: {inserted_count}")
         print(f"  Rows failed: {failed_count}")
+        print(f"  exa_overwrites_applied: {exa_overwrites_applied}")
+        print(f"  exa_values_used_for_new_rows: {exa_values_used_for_new_rows}")
         print("Upload workflow completed!")
 
 

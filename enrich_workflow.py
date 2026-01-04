@@ -103,6 +103,9 @@ class EnrichmentWorkflow:
         self.prospects_blocked_malformed_run_if = 0
         self.rows_claimed = 0
         self.rows_skipped_already_claimed = 0
+        self.exa_api_calls_made = 0
+        self.exa_api_skipped_because_existing_exa_summary = 0
+        self.exa_api_skipped_because_run_exa_false = 0
         
         # Prompts loaded from database (list of dicts with step_order, prompt_text, run_if)
         self.prompts: List[Dict[str, Any]] = []
@@ -554,6 +557,24 @@ class EnrichmentWorkflow:
             value = str(value)
         return not value.strip()
     
+    def _is_exa_summary_empty(self, exa_summary: Optional[str]) -> bool:
+        """
+        Check if exa_summary is empty.
+        
+        Empty means: NULL or "" or whitespace-only.
+        
+        Args:
+            exa_summary: The exa_summary value to check
+            
+        Returns:
+            True if empty, False otherwise
+        """
+        if exa_summary is None:
+            return True
+        if not isinstance(exa_summary, str):
+            return True
+        return not exa_summary.strip()
+    
     def _build_company_summary(self, exa_summary: Optional[str], short_description: Optional[str]) -> str:
         """
         Build company_summary from exa_summary and short_description.
@@ -965,21 +986,24 @@ class EnrichmentWorkflow:
                 # Copy existing step outputs
                 cached_step_outputs = existing_step_outputs.copy()
                 
-                # STEP 1: Get Exa summary (if RUN_EXA is True)
-                if RUN_EXA:
-                    if existing_exa_summary and existing_exa_summary.strip():
-                        # Reuse existing Exa summary
-                        cached_exa_summary = existing_exa_summary
-                    else:
-                        # Fetch Exa summary (attempt once, no retries)
-                        cached_exa_summary = await self.get_exa_summary(website)
-                        # If Exa fails, accept it and proceed (do not mark as failed)
-                        if not cached_exa_summary or not cached_exa_summary.strip():
-                            print(f"  [EXA] No summary found for {website} (ID: {prospect_id}, run_id: {self.run_id}) - proceeding without Exa")
-                            self.exa_failures += 1
-                            cached_exa_summary = None
-                else:
+                # STEP 1: Get Exa summary (conditional on RUN_EXA and exa_summary emptiness)
+                if not RUN_EXA:
+                    # RUN_EXA is False: NEVER call Exa API
+                    self.exa_api_skipped_because_run_exa_false += 1
                     cached_exa_summary = None
+                elif not self._is_exa_summary_empty(existing_exa_summary):
+                    # RUN_EXA is True but exa_summary already has text (including from CSV): reuse it
+                    cached_exa_summary = existing_exa_summary
+                    self.exa_api_skipped_because_existing_exa_summary += 1
+                else:
+                    # RUN_EXA is True AND exa_summary is empty: call Exa API
+                    self.exa_api_calls_made += 1
+                    cached_exa_summary = await self.get_exa_summary(website)
+                    # If Exa fails, accept it and proceed (do not mark as failed)
+                    if not cached_exa_summary or not cached_exa_summary.strip():
+                        print(f"  [EXA] No summary found for {website} (ID: {prospect_id}, run_id: {self.run_id}) - proceeding without Exa")
+                        self.exa_failures += 1
+                        cached_exa_summary = None
                 
                 # STEP 2: Build company_summary
                 cached_company_summary = self._build_company_summary(cached_exa_summary, short_description)
@@ -1580,6 +1604,9 @@ class EnrichmentWorkflow:
         print(f"prospects_skipped_missing_placeholders: {self.prospects_skipped_missing_placeholders}")
         print(f"prompts_loaded_count: {self.prompts_loaded_count}")
         print(f"exa_failures: {self.exa_failures}")
+        print(f"exa_api_calls_made: {self.exa_api_calls_made}")
+        print(f"exa_api_skipped_because_existing_exa_summary: {self.exa_api_skipped_because_existing_exa_summary}")
+        print(f"exa_api_skipped_because_run_exa_false: {self.exa_api_skipped_because_run_exa_false}")
         print(f"ai_calls_attempted: {self.ai_calls_attempted}")
         print(f"ai_calls_retried: {self.ai_calls_retried}")
         print(f"db_writes_attempted: {self.db_writes_attempted}")
