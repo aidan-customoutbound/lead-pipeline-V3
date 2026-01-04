@@ -1282,15 +1282,19 @@ class EnrichmentWorkflow:
                                 self.branch_steps_no_match_skipped += 1
                                 continue  # Continue to next step
                             
-                            if selected_prompt == "":
-                                # Selected prompt is empty string - skip step
-                                print(f"  [SKIP BRANCH] Prospect {prospect_id} (run_id: {self.run_id}) step={step_num} branch selected empty string")
+                            # Normalize selected prompt: handle None, then strip whitespace
+                            normalized_selected_prompt = selected_prompt.strip() if selected_prompt else ""
+                            
+                            if normalized_selected_prompt == "":
+                                # Selected prompt is empty/whitespace - skip step (DO NOT call LLM)
+                                print(f"  [SKIP BRANCH] Prospect {prospect_id} (run_id: {self.run_id}) step={step_num} branch selected empty/whitespace prompt")
                                 cached_step_outputs[step_num] = ""  # Set to empty string
+                                # Increment appropriate counters
                                 if rule_type == 'match':
                                     self.branch_steps_matched += 1
                                 elif rule_type == 'else':
                                     self.branch_steps_else_taken += 1
-                                continue  # Continue to next step
+                                continue  # Continue to next step (skip dependency checks and LLM call)
                             
                             # Track which rule type was selected
                             if rule_type == 'match':
@@ -1324,6 +1328,14 @@ class EnrichmentWorkflow:
                             
                             # Exit processing for this prospect (no further steps attempted)
                             return
+                    
+                    # Check if selected prompt (branch or non-branch) is empty/whitespace - skip if so
+                    normalized_prompt = selected_prompt_template.strip() if selected_prompt_template else ""
+                    if normalized_prompt == "":
+                        # Prompt is empty/whitespace - skip step (DO NOT call LLM)
+                        print(f"  [SKIP EMPTY PROMPT] Prospect {prospect_id} (run_id: {self.run_id}) step={step_num} prompt is empty/whitespace")
+                        cached_step_outputs[step_num] = ""  # Set to empty string
+                        continue  # Continue to next step (skip dependency checks and LLM call)
                     
                     # Now check dependencies on the selected prompt (after branch selection)
                     placeholders = self._extract_placeholders(selected_prompt_template)
