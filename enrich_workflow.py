@@ -579,6 +579,50 @@ class EnrichmentWorkflow:
         normalized = ' '.join(normalized.split())
         return normalized
     
+    def _normalize_branch_prompt_text(self, prompt_text: str) -> str:
+        """
+        Normalize Branch DSL prompt text by removing quotes and handling empty strings.
+        
+        This handles cases like:
+        - '""' -> '' (quoted empty string)
+        - "''" -> '' (quoted empty string with single quotes)
+        - '  ""  ' -> '' (quoted empty with whitespace)
+        - '"text"' -> 'text' (remove one layer of quotes)
+        - "'text'" -> 'text' (remove one layer of single quotes)
+        
+        Args:
+            prompt_text: The prompt text to normalize
+            
+        Returns:
+            Normalized prompt text (empty string if input is empty/whitespace/quoted-empty)
+        """
+        if not prompt_text:
+            return ""
+        
+        # Strip outer whitespace first
+        normalized = prompt_text.strip()
+        
+        # If empty after strip, return empty string
+        if not normalized:
+            return ""
+        
+        # Check if wrapped in matching quotes (single or double) and remove one layer
+        # Handle double quotes: "text" or ""
+        if len(normalized) >= 2 and normalized[0] == '"' and normalized[-1] == '"':
+            normalized = normalized[1:-1]
+        # Handle single quotes: 'text' or ''
+        elif len(normalized) >= 2 and normalized[0] == "'" and normalized[-1] == "'":
+            normalized = normalized[1:-1]
+        
+        # After unquoting, strip again and check if empty/whitespace
+        normalized = normalized.strip()
+        
+        # If result is empty, whitespace-only, or exactly "" / '' (quoted-empty), normalize to ""
+        if not normalized or normalized == '""' or normalized == "''":
+            return ""
+        
+        return normalized
+    
     def _parse_branch(self, branch_text: str) -> tuple[str, List[Dict[str, Any]]]:
         """
         Parse a Branch DSL string into placeholder and rules.
@@ -652,6 +696,8 @@ class EnrichmentWorkflow:
                 if not else_match:
                     raise ValueError(f"Malformed ELSE rule: {line}. Expected format: ELSE :: prompt_text")
                 prompt_text = else_match.group(1).strip()
+                # Normalize prompt text (remove quotes, handle empty strings)
+                prompt_text = self._normalize_branch_prompt_text(prompt_text)
                 rules.append({
                     'type': 'else',
                     'prompt_text': prompt_text
@@ -663,6 +709,8 @@ class EnrichmentWorkflow:
                     raise ValueError(f"Malformed match rule: {line}. Expected format: \"match\" :: prompt_text")
                 match_value = match_rule.group(1)
                 prompt_text = match_rule.group(2).strip()
+                # Normalize prompt text (remove quotes, handle empty strings)
+                prompt_text = self._normalize_branch_prompt_text(prompt_text)
                 rules.append({
                     'type': 'match',
                     'match_value': match_value,
