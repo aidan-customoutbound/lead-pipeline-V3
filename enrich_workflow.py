@@ -1145,6 +1145,8 @@ class EnrichmentWorkflow:
         if not row_ids or not self.run_id:
             return []
         
+        print("[CLAIM] Using update().execute() without select() (compat mode)")
+        
         claimed_ids = []
         thirty_min_ago = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
         update_data = {
@@ -1173,12 +1175,24 @@ class EnrichmentWorkflow:
                     .eq('id', row_id)
                     .eq('status', 'new')
                     .is_('processing_run_id', 'null')
-                    .select('id')
                     .execute()
                 )
                 
-                # Check response data length
+                # Extract IDs from response.data
+                extracted_ids = []
+                if response.data:
+                    if isinstance(response.data, list):
+                        # List of dicts
+                        for row in response.data:
+                            if isinstance(row, dict) and 'id' in row:
+                                extracted_ids.append(row['id'])
+                    elif isinstance(response.data, dict):
+                        # Single dict
+                        if 'id' in response.data:
+                            extracted_ids.append(response.data['id'])
+                
                 response_data_len = len(response.data) if response.data else 0
+                extracted_count = len(extracted_ids)
                 
                 # Check for REAL error signals:
                 # - status_code >= 400
@@ -1209,25 +1223,23 @@ class EnrichmentWorkflow:
                 
                 error_info = ' '.join(error_info_parts) if error_info_parts else None
                 
-                # Log diagnostic
-                if response_data_len > 0:
+                # Log diagnostic - SUCCESS only if we extracted at least one ID
+                if extracted_count > 0:
                     # Successfully claimed
-                    for row in response.data:
-                        returned_id = row.get('id')
-                        if returned_id is not None:
-                            claimed_ids.append(returned_id)
-                            self.rows_claimed += 1
-                            claimed_count += 1
-                            row_claimed = True
-                            break
+                    for returned_id in extracted_ids:
+                        claimed_ids.append(returned_id)
+                        self.rows_claimed += 1
+                        claimed_count += 1
+                        row_claimed = True
+                        break
                 elif has_real_error:
                     # REAL error in response
                     error_count += 1
-                    print(f"  [CLAIM ERROR] row_id={row_id} attempt=A where=\"{where_a}\" returned_rows={response_data_len} {error_info}")
+                    print(f"  [CLAIM ERROR] row_id={row_id} attempt=A where=\"{where_a}\" returned_rows={response_data_len} extracted_ids={extracted_count} {error_info}")
                 else:
                     # No match (row didn't match WHERE clause) - normal NO-MATCH case
                     no_match_count += 1
-                    print(f"  [CLAIM NO-MATCH] row_id={row_id} attempt=A where=\"{where_a}\" returned_rows={response_data_len}")
+                    print(f"  [CLAIM NO-MATCH] row_id={row_id} attempt=A where=\"{where_a}\" returned_rows={response_data_len} extracted_ids={extracted_count}")
                     
             except Exception as e:
                 exception_count += 1
@@ -1248,12 +1260,24 @@ class EnrichmentWorkflow:
                     .eq('id', row_id)
                     .eq('status', 'new')
                     .lt('processing_started_at', thirty_min_ago)
-                    .select('id')
                     .execute()
                 )
                 
-                # Check response data length
+                # Extract IDs from response.data
+                extracted_ids = []
+                if response.data:
+                    if isinstance(response.data, list):
+                        # List of dicts
+                        for row in response.data:
+                            if isinstance(row, dict) and 'id' in row:
+                                extracted_ids.append(row['id'])
+                    elif isinstance(response.data, dict):
+                        # Single dict
+                        if 'id' in response.data:
+                            extracted_ids.append(response.data['id'])
+                
                 response_data_len = len(response.data) if response.data else 0
+                extracted_count = len(extracted_ids)
                 
                 # Check for REAL error signals:
                 # - status_code >= 400
@@ -1284,25 +1308,23 @@ class EnrichmentWorkflow:
                 
                 error_info = ' '.join(error_info_parts) if error_info_parts else None
                 
-                # Log diagnostic
-                if response_data_len > 0:
+                # Log diagnostic - SUCCESS only if we extracted at least one ID
+                if extracted_count > 0:
                     # Successfully claimed
-                    for row in response.data:
-                        returned_id = row.get('id')
-                        if returned_id is not None:
-                            claimed_ids.append(returned_id)
-                            self.rows_claimed += 1
-                            claimed_count += 1
-                            row_claimed = True
-                            break
+                    for returned_id in extracted_ids:
+                        claimed_ids.append(returned_id)
+                        self.rows_claimed += 1
+                        claimed_count += 1
+                        row_claimed = True
+                        break
                 elif has_real_error:
                     # REAL error in response
                     error_count += 1
-                    print(f"  [CLAIM ERROR] row_id={row_id} attempt=B where=\"{where_b}\" returned_rows={response_data_len} {error_info}")
+                    print(f"  [CLAIM ERROR] row_id={row_id} attempt=B where=\"{where_b}\" returned_rows={response_data_len} extracted_ids={extracted_count} {error_info}")
                 else:
                     # No match (row didn't match WHERE clause) - normal NO-MATCH case
                     no_match_count += 1
-                    print(f"  [CLAIM NO-MATCH] row_id={row_id} attempt=B where=\"{where_b}\" returned_rows={response_data_len}")
+                    print(f"  [CLAIM NO-MATCH] row_id={row_id} attempt=B where=\"{where_b}\" returned_rows={response_data_len} extracted_ids={extracted_count}")
                     
             except Exception as e:
                 exception_count += 1
