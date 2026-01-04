@@ -1152,70 +1152,170 @@ class EnrichmentWorkflow:
             'processing_started_at': datetime.utcnow().isoformat()
         }
         
+        # Per-batch counters for diagnostics
+        attempted_count = len(row_ids)
+        claimed_count = 0
+        no_match_count = 0
+        error_count = 0
+        exception_count = 0
+        
         # Claim each row atomically by updating with eligibility check in WHERE clause
         # Use UPDATE ... RETURNING id to get only rows that were actually claimed
         for row_id in row_ids:
+            row_claimed = False
+            
+            # Attempt A: Update rows where status='new' AND processing_run_id IS NULL
+            where_a = f"id={row_id} AND status='new' AND processing_run_id IS NULL"
             try:
-                # Attempt A: Update rows where status='new' AND processing_run_id IS NULL
-                # This is atomic: only rows that match both conditions will be updated
-                # RETURNING id ensures we only get IDs of rows that were actually claimed
-                try:
-                    response = (
-                        self.supabase.table('prospects')
-                        .update(update_data)
-                        .eq('id', row_id)
-                        .eq('status', 'new')
-                        .is_('processing_run_id', 'null')
-                        .select('id')
-                        .execute()
-                    )
+                response = (
+                    self.supabase.table('prospects')
+                    .update(update_data)
+                    .eq('id', row_id)
+                    .eq('status', 'new')
+                    .is_('processing_run_id', 'null')
+                    .select('id')
+                    .execute()
+                )
+                
+                # Check response data length
+                response_data_len = len(response.data) if response.data else 0
+                
+                # Check for REAL error signals:
+                # - status_code >= 400
+                # - error is present/non-empty
+                # - code is present/non-empty
+                # - message is present/non-empty
+                has_real_error = False
+                error_info_parts = []
+                
+                if hasattr(response, 'status_code') and response.status_code is not None:
+                    status_code = response.status_code
+                    if status_code >= 400:
+                        has_real_error = True
+                        error_info_parts.append(f'status_code={status_code}')
+                    # Note: status_code in 200-299 is NOT an error by itself
+                
+                if hasattr(response, 'error') and response.error:
+                    has_real_error = True
+                    error_info_parts.append(f'error="{response.error}"')
+                
+                if hasattr(response, 'code') and response.code:
+                    has_real_error = True
+                    error_info_parts.append(f'code={response.code}')
+                
+                if hasattr(response, 'message') and response.message:
+                    has_real_error = True
+                    error_info_parts.append(f'message="{response.message}"')
+                
+                error_info = ' '.join(error_info_parts) if error_info_parts else None
+                
+                # Log diagnostic
+                if response_data_len > 0:
+                    # Successfully claimed
+                    for row in response.data:
+                        returned_id = row.get('id')
+                        if returned_id is not None:
+                            claimed_ids.append(returned_id)
+                            self.rows_claimed += 1
+                            claimed_count += 1
+                            row_claimed = True
+                            break
+                elif has_real_error:
+                    # REAL error in response
+                    error_count += 1
+                    print(f"  [CLAIM ERROR] row_id={row_id} attempt=A where=\"{where_a}\" returned_rows={response_data_len} {error_info}")
+                else:
+                    # No match (row didn't match WHERE clause) - normal NO-MATCH case
+                    no_match_count += 1
+                    print(f"  [CLAIM NO-MATCH] row_id={row_id} attempt=A where=\"{where_a}\" returned_rows={response_data_len}")
                     
-                    # Extract IDs from RETURNING clause - only these rows were actually claimed
-                    if response.data:
-                        for row in response.data:
-                            returned_id = row.get('id')
-                            if returned_id is not None:
-                                claimed_ids.append(returned_id)
-                                self.rows_claimed += 1
-                                break  # Only one row should be returned per row_id
-                        continue  # Successfully claimed, skip Attempt B
-                except Exception:
-                    pass
-                
-                # Attempt B: Update rows where status='new' AND processing_started_at < thirty_min_ago
-                # This handles the case where a previous run crashed and the row is stale
-                # Note: If processing_started_at is NULL, the comparison won't match (correct behavior)
-                # If processing_run_id was NULL, Attempt A would have caught it
-                try:
-                    response = (
-                        self.supabase.table('prospects')
-                        .update(update_data)
-                        .eq('id', row_id)
-                        .eq('status', 'new')
-                        .lt('processing_started_at', thirty_min_ago)
-                        .select('id')
-                        .execute()
-                    )
-                    
-                    # Extract IDs from RETURNING clause - only these rows were actually claimed
-                    if response.data:
-                        for row in response.data:
-                            returned_id = row.get('id')
-                            if returned_id is not None:
-                                claimed_ids.append(returned_id)
-                                self.rows_claimed += 1
-                                break  # Only one row should be returned per row_id
-                        continue  # Successfully claimed
-                except Exception:
-                    pass
-                
-                # If we get here, the row was not eligible (already claimed by another run)
-                self.rows_skipped_already_claimed += 1
-                print(f"  [CLAIM SKIP] Row {row_id} (run_id: {self.run_id}): Already claimed by another run, skipping")
-                
             except Exception as e:
-                print(f"  [CLAIM ERROR] Error claiming row {row_id}: {str(e)}")
-                # Don't add to claimed_ids on error
+                exception_count += 1
+                exc_type = type(e).__name__
+                exc_msg = str(e)
+                print(f"  [CLAIM EXCEPTION] row_id={row_id} attempt=A where=\"{where_a}\" exception_type={exc_type} exception_msg=\"{exc_msg}\"")
+            
+            # If Attempt A succeeded, skip Attempt B
+            if row_claimed:
+                continue
+            
+            # Attempt B: Update rows where status='new' AND processing_started_at < thirty_min_ago
+            where_b = f"id={row_id} AND status='new' AND processing_started_at<'{thirty_min_ago}'"
+            try:
+                response = (
+                    self.supabase.table('prospects')
+                    .update(update_data)
+                    .eq('id', row_id)
+                    .eq('status', 'new')
+                    .lt('processing_started_at', thirty_min_ago)
+                    .select('id')
+                    .execute()
+                )
+                
+                # Check response data length
+                response_data_len = len(response.data) if response.data else 0
+                
+                # Check for REAL error signals:
+                # - status_code >= 400
+                # - error is present/non-empty
+                # - code is present/non-empty
+                # - message is present/non-empty
+                has_real_error = False
+                error_info_parts = []
+                
+                if hasattr(response, 'status_code') and response.status_code is not None:
+                    status_code = response.status_code
+                    if status_code >= 400:
+                        has_real_error = True
+                        error_info_parts.append(f'status_code={status_code}')
+                    # Note: status_code in 200-299 is NOT an error by itself
+                
+                if hasattr(response, 'error') and response.error:
+                    has_real_error = True
+                    error_info_parts.append(f'error="{response.error}"')
+                
+                if hasattr(response, 'code') and response.code:
+                    has_real_error = True
+                    error_info_parts.append(f'code={response.code}')
+                
+                if hasattr(response, 'message') and response.message:
+                    has_real_error = True
+                    error_info_parts.append(f'message="{response.message}"')
+                
+                error_info = ' '.join(error_info_parts) if error_info_parts else None
+                
+                # Log diagnostic
+                if response_data_len > 0:
+                    # Successfully claimed
+                    for row in response.data:
+                        returned_id = row.get('id')
+                        if returned_id is not None:
+                            claimed_ids.append(returned_id)
+                            self.rows_claimed += 1
+                            claimed_count += 1
+                            row_claimed = True
+                            break
+                elif has_real_error:
+                    # REAL error in response
+                    error_count += 1
+                    print(f"  [CLAIM ERROR] row_id={row_id} attempt=B where=\"{where_b}\" returned_rows={response_data_len} {error_info}")
+                else:
+                    # No match (row didn't match WHERE clause) - normal NO-MATCH case
+                    no_match_count += 1
+                    print(f"  [CLAIM NO-MATCH] row_id={row_id} attempt=B where=\"{where_b}\" returned_rows={response_data_len}")
+                    
+            except Exception as e:
+                exception_count += 1
+                exc_type = type(e).__name__
+                exc_msg = str(e)
+                print(f"  [CLAIM EXCEPTION] row_id={row_id} attempt=B where=\"{where_b}\" exception_type={exc_type} exception_msg=\"{exc_msg}\"")
+            
+            # If both attempts failed, update global counter
+            if not row_claimed:
+                self.rows_skipped_already_claimed += 1
+        
+        # Print per-batch summary
+        print(f"  [CLAIM SUMMARY] attempted={attempted_count} claimed={claimed_count} no_match={no_match_count} error={error_count} exception={exception_count}")
         
         return claimed_ids
     
