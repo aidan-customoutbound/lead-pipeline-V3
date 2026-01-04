@@ -12,6 +12,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -97,9 +98,14 @@ class EnrichmentWorkflow:
         self.steps_skipped_missing_placeholders = 0
         self.prospects_skipped_missing_placeholders = 0
         self.prospects_blocked_missing_placeholders = 0
+        self.steps_skipped_missing_dependencies = 0
+        self.steps_skipped_run_if_false = 0
+        self.prospects_blocked_malformed_run_if = 0
+        self.rows_claimed = 0
+        self.rows_skipped_already_claimed = 0
         
-        # Prompts loaded from database (list of prompt strings in order)
-        self.prompts: List[str] = []
+        # Prompts loaded from database (list of dicts with step_order, prompt_text, run_if)
+        self.prompts: List[Dict[str, Any]] = []
         
         # Run ID for idempotency within this run
         self.run_id = None
@@ -152,17 +158,17 @@ class EnrichmentWorkflow:
         
         return any(phrase in website_lower for phrase in junk_phrases)
     
-    def fetch_prompts(self) -> List[str]:
+    def fetch_prompts(self) -> List[Dict[str, Any]]:
         """
         Fetch active prompts from Supabase prompts table, ordered by step_order.
         
         Returns:
-            List of prompt strings in execution order
+            List of prompt dictionaries with step_order, prompt_text, and run_if in execution order
         """
         try:
             response = (
                 self.supabase.table('prompts')
-                .select('step_order, prompt_text')
+                .select('step_order, prompt_text, run_if')
                 .eq('is_active', True)
                 .order('step_order', desc=False)
                 .execute()
@@ -171,8 +177,15 @@ class EnrichmentWorkflow:
             if not response.data:
                 return []
             
-            # Extract prompt_text in order
-            prompts = [row['prompt_text'] for row in response.data]
+            # Extract prompts as dicts with step_order, prompt_text, and run_if
+            prompts = []
+            for row in response.data:
+                prompts.append({
+                    'step_order': row.get('step_order'),
+                    'prompt_text': row.get('prompt_text', ''),
+                    'run_if': row.get('run_if') or ''  # Convert None to empty string
+                })
+            
             self.prompts_loaded_count = len(prompts)
             return prompts
             
@@ -462,6 +475,64 @@ class EnrichmentWorkflow:
         """
         placeholders = re.findall(r'\{(\w+)\}', prompt_template)
         return placeholders
+    
+    def _parse_run_if(self, run_if: str) -> Optional[Dict[str, str]]:
+        """
+        Parse a run_if condition string.
+        
+        Grammar: {placeholder} contains: "value"
+        - Case-insensitive
+        - Spacing-insensitive
+        - Only operator supported: contains:
+        - Value must be in double quotes
+        
+        Args:
+            run_if: The run_if condition string (may be empty/None)
+            
+        Returns:
+            Dict with keys 'placeholder' and 'value' if valid, None if blank, raises ValueError if malformed
+        """
+        if not run_if or not run_if.strip():
+            return None  # Blank run_if means always run
+        
+        # Normalize: remove extra whitespace
+        normalized = ' '.join(run_if.split())
+        
+        # Pattern: {placeholder} contains: "value"
+        # Case-insensitive matching
+        pattern = r'\{(\w+)\}\s+contains:\s+"([^"]+)"'
+        match = re.search(pattern, normalized, re.IGNORECASE)
+        
+        if not match:
+            raise ValueError(f"Malformed run_if: {run_if}")
+        
+        return {
+            'placeholder': match.group(1),
+            'value': match.group(2)
+        }
+    
+    def _evaluate_run_if(self, run_if_parsed: Optional[Dict[str, str]], variables: Dict[str, str]) -> bool:
+        """
+        Evaluate a parsed run_if condition against variables.
+        
+        Args:
+            run_if_parsed: Parsed run_if dict (None means always run)
+            variables: Dictionary of variable names to values
+            
+        Returns:
+            True if condition passes (or run_if is blank), False otherwise
+        """
+        if run_if_parsed is None:
+            return True  # Blank run_if means always run
+        
+        placeholder = run_if_parsed['placeholder']
+        expected_value = run_if_parsed['value']
+        
+        # Get the actual value from variables (default to empty string)
+        actual_value = variables.get(placeholder, '')
+        
+        # Case-insensitive comparison
+        return expected_value.lower() in actual_value.lower()
     
     def _is_blank(self, value: Any) -> bool:
         """
@@ -762,15 +833,22 @@ class EnrichmentWorkflow:
                 update_data['exa_summary'] = exa_summary
             
             # Include step outputs (support up to step5)
-            # Only write non-blank step outputs to avoid overwriting existing data
+            # Write all step outputs (including empty strings for skipped steps)
             for step_num in range(1, 6):
                 step_key = f'step{step_num}_output'
-                if step_num in step_outputs and step_outputs[step_num]:
+                if step_num in step_outputs:
+                    # Write the value even if it's empty string (for skipped steps)
                     update_data[step_key] = step_outputs[step_num]
             
             # Optionally include blocked_reason if provided (column may not exist)
             if blocked_reason is not None:
                 update_data['blocked_reason'] = blocked_reason
+            
+            # Clear claim fields when row finishes successfully (enriched/skipped/blocked)
+            # This releases the row so it's available for future processing if needed
+            if status in ('enriched', 'skipped', 'blocked'):
+                update_data['processing_run_id'] = None
+                update_data['processing_started_at'] = None
             
             # Retry logic with linear backoff (1s, 2s, 3s)
             max_retries = 3
@@ -947,43 +1025,65 @@ class EnrichmentWorkflow:
                     for prev_step in range(1, step_num):
                         variables[f'step{prev_step}_output'] = cached_step_outputs.get(prev_step, '')
                     
-                    # Get prompt template for this step
-                    prompt_template = self.prompts[step_num - 1]  # 0-indexed
+                    # Get prompt dict for this step
+                    prompt_dict = self.prompts[step_num - 1]  # 0-indexed
+                    prompt_template = prompt_dict['prompt_text']
+                    run_if = prompt_dict.get('run_if', '') or ''
                     
-                    # Check for missing placeholders before calling LLM
+                    # MASTER DEPENDENCY RULE: Check if any placeholder in prompt_text resolves to empty string
                     placeholders = self._extract_placeholders(prompt_template)
-                    missing_placeholders = []
+                    has_empty_dependency = False
+                    empty_dependencies = []
                     
                     for placeholder in placeholders:
-                        placeholder_value = variables.get(placeholder)
-                        if self._is_blank(placeholder_value):
-                            missing_placeholders.append(placeholder)
+                        placeholder_value = variables.get(placeholder, '')
+                        # Treat None/blank as empty string
+                        if not placeholder_value or not str(placeholder_value).strip():
+                            has_empty_dependency = True
+                            empty_dependencies.append(placeholder)
                     
-                    if missing_placeholders:
-                        # IMMEDIATE BLOCKING: Missing placeholders detected for a required step
-                        # Do NOT call the LLM - block the prospect immediately
-                        self.prospects_blocked_missing_placeholders += 1
-                        print(f"  [BLOCKED] Prospect {prospect_id} (run_id: {self.run_id}) website={normalized_website} step={step_num} missing={','.join(missing_placeholders)}")
+                    if has_empty_dependency:
+                        # Skip this step - set output to empty string and continue
+                        print(f"  [SKIP DEPENDENCY] Prospect {prospect_id} (run_id: {self.run_id}) step={step_num} missing dependencies: {','.join(empty_dependencies)}")
+                        cached_step_outputs[step_num] = ""  # Set to empty string
+                        self.steps_skipped_missing_dependencies += 1
+                        continue  # Continue to next step
+                    
+                    # Parse and evaluate run_if condition
+                    try:
+                        run_if_parsed = self._parse_run_if(run_if)
+                        run_if_passes = self._evaluate_run_if(run_if_parsed, variables)
+                    except ValueError as e:
+                        # Malformed run_if - block the prospect
+                        malformed_reason = f"Malformed run_if: {run_if}"
+                        print(f"  [BLOCKED] Prospect {prospect_id} (run_id: {self.run_id}) website={normalized_website} step={step_num} - {malformed_reason}")
+                        self.prospects_blocked_malformed_run_if += 1
                         
                         # Persist blocked status to DB immediately
-                        # Pass empty step_outputs dict to preserve existing outputs
                         write_success = await self._write_prospect_with_retry(
                             prospect_id,
                             cached_exa_summary,
                             cached_company_summary,
                             {},  # Empty dict - do not overwrite existing step outputs
                             'blocked',
-                            db_write_semaphore
+                            db_write_semaphore,
+                            blocked_reason=malformed_reason
                         )
                         
                         if not write_success:
                             print(f"  [ERROR] Failed to write blocked status for prospect {prospect_id}")
-                            # Even if write fails, we still exit (don't retry infinitely)
                         
                         # Exit processing for this prospect (no further steps attempted)
                         return
                     
-                    # Run the step
+                    if not run_if_passes:
+                        # run_if evaluated to False - skip this step
+                        print(f"  [SKIP RUN_IF] Prospect {prospect_id} (run_id: {self.run_id}) step={step_num} run_if condition not met")
+                        cached_step_outputs[step_num] = ""  # Set to empty string
+                        self.steps_skipped_run_if_false += 1
+                        continue  # Continue to next step
+                    
+                    # Both dependency rule and run_if passed - run the step
                     step_result = await self._run_enrichment_step(step_num, prompt_template, variables)
                     
                     if not step_result:
@@ -995,7 +1095,7 @@ class EnrichmentWorkflow:
                     # Store the result in memory cache
                     cached_step_outputs[step_num] = step_result
                 
-                # All steps succeeded - perform single final write to Supabase
+                # All steps processed (some may have been skipped) - perform single final write to Supabase
                 write_success = await self._write_prospect_with_retry(
                     prospect_id,
                     cached_exa_summary,
@@ -1030,27 +1130,171 @@ class EnrichmentWorkflow:
                 cached_company_summary = ""
                 cached_step_outputs = {}
     
+    def _claim_rows_atomically(self, row_ids: List[Any]) -> List[Any]:
+        """
+        Atomically claim rows by setting processing_run_id and processing_started_at.
+        Only claims rows that are still eligible (status='new' AND (processing_run_id IS NULL OR processing_started_at < now() - interval '30 minutes')).
+        Uses UPDATE ... RETURNING id to ensure 100% atomic and provably safe claiming.
+        
+        Args:
+            row_ids: List of row IDs to attempt to claim
+            
+        Returns:
+            List of row IDs that were successfully claimed (only IDs returned from UPDATE ... RETURNING)
+        """
+        if not row_ids or not self.run_id:
+            return []
+        
+        claimed_ids = []
+        thirty_min_ago = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
+        update_data = {
+            'processing_run_id': self.run_id,
+            'processing_started_at': datetime.utcnow().isoformat()
+        }
+        
+        # Claim each row atomically by updating with eligibility check in WHERE clause
+        # Use UPDATE ... RETURNING id to get only rows that were actually claimed
+        for row_id in row_ids:
+            try:
+                # Attempt A: Update rows where status='new' AND processing_run_id IS NULL
+                # This is atomic: only rows that match both conditions will be updated
+                # RETURNING id ensures we only get IDs of rows that were actually claimed
+                try:
+                    response = (
+                        self.supabase.table('prospects')
+                        .update(update_data)
+                        .eq('id', row_id)
+                        .eq('status', 'new')
+                        .is_('processing_run_id', 'null')
+                        .select('id')
+                        .execute()
+                    )
+                    
+                    # Extract IDs from RETURNING clause - only these rows were actually claimed
+                    if response.data:
+                        for row in response.data:
+                            returned_id = row.get('id')
+                            if returned_id is not None:
+                                claimed_ids.append(returned_id)
+                                self.rows_claimed += 1
+                                break  # Only one row should be returned per row_id
+                        continue  # Successfully claimed, skip Attempt B
+                except Exception:
+                    pass
+                
+                # Attempt B: Update rows where status='new' AND processing_started_at < thirty_min_ago
+                # This handles the case where a previous run crashed and the row is stale
+                # Note: If processing_started_at is NULL, the comparison won't match (correct behavior)
+                # If processing_run_id was NULL, Attempt A would have caught it
+                try:
+                    response = (
+                        self.supabase.table('prospects')
+                        .update(update_data)
+                        .eq('id', row_id)
+                        .eq('status', 'new')
+                        .lt('processing_started_at', thirty_min_ago)
+                        .select('id')
+                        .execute()
+                    )
+                    
+                    # Extract IDs from RETURNING clause - only these rows were actually claimed
+                    if response.data:
+                        for row in response.data:
+                            returned_id = row.get('id')
+                            if returned_id is not None:
+                                claimed_ids.append(returned_id)
+                                self.rows_claimed += 1
+                                break  # Only one row should be returned per row_id
+                        continue  # Successfully claimed
+                except Exception:
+                    pass
+                
+                # If we get here, the row was not eligible (already claimed by another run)
+                self.rows_skipped_already_claimed += 1
+                print(f"  [CLAIM SKIP] Row {row_id} (run_id: {self.run_id}): Already claimed by another run, skipping")
+                
+            except Exception as e:
+                print(f"  [CLAIM ERROR] Error claiming row {row_id}: {str(e)}")
+                # Don't add to claimed_ids on error
+        
+        return claimed_ids
+    
     def fetch_batch(self, limit: int = BATCH_SIZE) -> list:
         """
-        Fetch a batch of prospects with status 'new' from Supabase.
+        Fetch a batch of prospects with status 'new' from Supabase and atomically claim them.
+        Only fetches rows that are eligible: status='new' AND (processing_run_id IS NULL OR processing_started_at < now() - interval '30 minutes').
         Also fetch existing step outputs to support "only fill blanks" logic.
+        
+        Returns ONLY rows whose IDs were returned from UPDATE ... RETURNING id in _claim_rows_atomically().
+        No inference of success - relies exclusively on returned IDs.
         
         Args:
             limit: Number of rows to fetch
             
         Returns:
-            List of prospect dictionaries
+            List of prospect dictionaries (only rows that were successfully claimed via UPDATE ... RETURNING)
         """
+        if not self.run_id:
+            print("Error: run_id not set. Cannot claim rows.")
+            return []
+        
         try:
+            # Calculate 30 minutes ago for eligibility check
+            thirty_min_ago = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
+            
+            # Fetch eligible rows: status='new' AND (processing_run_id IS NULL OR processing_started_at < thirty_min_ago)
+            # We'll fetch a larger batch to account for rows that might not be claimable
+            # Then we'll claim them atomically and return only the claimed ones
+            
+            # First, fetch rows with status='new' that are potentially eligible
+            # We'll fetch more than limit to account for rows that might be claimed by other runs
+            fetch_limit = limit * 2  # Fetch 2x to account for potential conflicts
+            
             response = (
                 self.supabase.table('prospects')
-                .select('id, website, short_description, exa_summary, company_summary, step1_output, step2_output, step3_output, step4_output, step5_output')
+                .select('id, website, short_description, exa_summary, company_summary, step1_output, step2_output, step3_output, step4_output, step5_output, processing_run_id, processing_started_at')
                 .eq('status', 'new')
-                .limit(limit)
+                .limit(fetch_limit)
                 .execute()
             )
             
-            return response.data if response.data else []
+            if not response.data:
+                return []
+            
+            # Filter to only eligible rows (processing_run_id IS NULL OR processing_started_at < thirty_min_ago)
+            eligible_rows = []
+            for row in response.data:
+                processing_run_id = row.get('processing_run_id')
+                processing_started_at = row.get('processing_started_at')
+                
+                # Check eligibility: NULL processing_run_id OR old processing_started_at
+                is_eligible = (
+                    processing_run_id is None or
+                    (processing_started_at and processing_started_at < thirty_min_ago)
+                )
+                
+                if is_eligible:
+                    eligible_rows.append(row)
+            
+            # Limit to requested batch size
+            eligible_rows = eligible_rows[:limit]
+            
+            if not eligible_rows:
+                return []
+            
+            # Extract row IDs for claiming
+            row_ids = [row['id'] for row in eligible_rows]
+            
+            # Atomically claim the rows using UPDATE ... RETURNING id
+            # This returns ONLY the IDs that were actually claimed in the UPDATE
+            claimed_ids = self._claim_rows_atomically(row_ids)
+            
+            # Return only the rows whose IDs were returned from UPDATE ... RETURNING
+            # No inference - rely exclusively on returned IDs
+            claimed_rows = [row for row in eligible_rows if row['id'] in claimed_ids]
+            
+            return claimed_rows
+            
         except Exception as e:
             print(f"Error fetching prospects batch: {str(e)}")
             return []
@@ -1089,8 +1333,12 @@ class EnrichmentWorkflow:
             return
         
         print(f"  ✓ Loaded {len(self.prompts)} active prompts")
-        for i, prompt in enumerate(self.prompts, 1):
-            print(f"    Step {i}: {prompt[:80]}..." if len(prompt) > 80 else f"    Step {i}: {prompt}")
+        for i, prompt_dict in enumerate(self.prompts, 1):
+            prompt_text = prompt_dict['prompt_text']
+            run_if = prompt_dict.get('run_if', '') or ''
+            run_if_display = f" [run_if: {run_if}]" if run_if else ""
+            prompt_display = prompt_text[:80] + "..." if len(prompt_text) > 80 else prompt_text
+            print(f"    Step {i}: {prompt_display}{run_if_display}")
         
         print("\n[3/5] Initializing clients...")
         print(f"  ✓ Supabase client initialized")
@@ -1203,7 +1451,10 @@ class EnrichmentWorkflow:
         print(f"prospects_deferred_db_write: {self.prospects_deferred_db_write}")
         print(f"prospects_skipped_summary_too_short: {self.prospects_skipped_summary_too_short}")
         print(f"prospects_blocked_missing_placeholders: {self.prospects_blocked_missing_placeholders}")
+        print(f"prospects_blocked_malformed_run_if: {self.prospects_blocked_malformed_run_if}")
         print(f"steps_skipped_missing_placeholders: {self.steps_skipped_missing_placeholders}")
+        print(f"steps_skipped_missing_dependencies: {self.steps_skipped_missing_dependencies}")
+        print(f"steps_skipped_run_if_false: {self.steps_skipped_run_if_false}")
         print(f"prospects_skipped_missing_placeholders: {self.prospects_skipped_missing_placeholders}")
         print(f"prompts_loaded_count: {self.prompts_loaded_count}")
         print(f"exa_failures: {self.exa_failures}")
@@ -1212,6 +1463,8 @@ class EnrichmentWorkflow:
         print(f"db_writes_attempted: {self.db_writes_attempted}")
         print(f"db_write_retries: {self.db_write_retries}")
         print(f"db_write_failures: {self.db_write_failures}")
+        print(f"rows_claimed: {self.rows_claimed}")
+        print(f"rows_skipped_already_claimed: {self.rows_skipped_already_claimed}")
         print("=" * 60)
 
 

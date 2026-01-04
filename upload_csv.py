@@ -87,15 +87,16 @@ class CSVUploader:
             self.has_prompts_column = True
             return True
     
-    def extract_prompts_from_csv(self, csv_path: str) -> tuple[List[str], int]:
+    def extract_prompts_from_csv(self, csv_path: str) -> tuple[List[Dict[str, str]], int]:
         """
-        Extract and normalize prompts from the Prompts column in the CSV.
+        Extract and normalize prompts and run_if from the Prompts and Run If columns in the CSV.
         
         Args:
             csv_path: Path to the CSV file
             
         Returns:
-            Tuple of (deduplicated prompts list, raw count before deduplication)
+            Tuple of (deduplicated prompts list with run_if, raw count before deduplication)
+            Each item in the list is a dict with 'prompt_text' and 'run_if' keys
         """
         prompts_raw = []
         
@@ -113,21 +114,26 @@ class CSVUploader:
                         f"Found columns: {', '.join(reader.fieldnames)}"
                     )
                 
-                # Collect all non-empty prompts
+                # Collect all non-empty prompts with their run_if values
                 for row in reader:
                     prompt = row.get('Prompts', '').strip()
                     if prompt:  # Only add non-empty prompts after stripping
-                        prompts_raw.append(prompt)
+                        run_if = row.get('Run If', '').strip()
+                        prompts_raw.append({
+                            'prompt_text': prompt,
+                            'run_if': run_if if run_if else None
+                        })
             
             prompts_found_raw = len(prompts_raw)
             
-            # Deduplicate while preserving order
+            # Deduplicate while preserving order (keep first occurrence's run_if)
             prompts_seen = set()
             prompts_deduplicated = []
-            for prompt in prompts_raw:
-                if prompt not in prompts_seen:
-                    prompts_seen.add(prompt)
-                    prompts_deduplicated.append(prompt)
+            for prompt_data in prompts_raw:
+                prompt_text = prompt_data['prompt_text']
+                if prompt_text not in prompts_seen:
+                    prompts_seen.add(prompt_text)
+                    prompts_deduplicated.append(prompt_data)
             
             return prompts_deduplicated, prompts_found_raw
             
@@ -136,12 +142,12 @@ class CSVUploader:
         except Exception as e:
             raise Exception(f"Error reading prompts from CSV file: {str(e)}")
     
-    def upload_prompts(self, prompts: List[str]) -> None:
+    def upload_prompts(self, prompts: List[Dict[str, str]]) -> None:
         """
         Replace all prompts in public.prompts table with the new prompt list.
         
         Args:
-            prompts: List of prompt strings to insert
+            prompts: List of prompt dictionaries with 'prompt_text' and 'run_if' keys
             
         Raises:
             Exception: If upload fails
@@ -162,10 +168,11 @@ class CSVUploader:
             
             # Prepare insert data
             insert_data = []
-            for idx, prompt_text in enumerate(prompts, start=1):
+            for idx, prompt_data in enumerate(prompts, start=1):
                 insert_data.append({
                     'step_order': idx,
-                    'prompt_text': prompt_text,
+                    'prompt_text': prompt_data['prompt_text'],
+                    'run_if': prompt_data.get('run_if'),
                     'is_active': True,
                     'step_name': f'step{idx}'
                 })
@@ -386,8 +393,8 @@ class CSVUploader:
             prompts_deduplicated, prompts_found_raw = self.extract_prompts_from_csv(INPUT_CSV)
             prompts_inserted = len(prompts_deduplicated)
             
-            print(f"Found {prompts_found_raw} non-empty prompts (raw)")
-            print(f"After deduplication: {prompts_inserted} unique prompts")
+            print(f"prompts_found_raw: {prompts_found_raw}")
+            print(f"prompts_inserted: {prompts_inserted}")
             
             # If zero prompts found, log error and exit
             if prompts_inserted == 0:
@@ -397,7 +404,7 @@ class CSVUploader:
             # Upload prompts
             print("Uploading prompts to public.prompts...")
             self.upload_prompts(prompts_deduplicated)
-            print(f"Deleted existing prompts and inserted {prompts_inserted} new prompts.")
+            print(f"Deleted existing prompts and inserted {prompts_inserted} new prompts (with run_if).")
             
         except Exception as e:
             print(f"ERROR: Failed to upload prompts: {str(e)}")
