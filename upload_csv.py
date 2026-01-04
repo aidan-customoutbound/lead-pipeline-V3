@@ -89,50 +89,76 @@ class CSVUploader:
     
     def extract_prompts_from_csv(self, csv_path: str) -> tuple[List[Dict[str, str]], int]:
         """
-        Extract and normalize prompts and run_if from the Prompts and Run If columns in the CSV.
+        Extract and normalize prompts, run_if, and branch from the Prompts, Run If, and Branch columns in the CSV.
+        
+        Supports "Branch-only" steps: a row is considered a valid prompt step if it has:
+        - non-blank Prompts OR
+        - non-blank Branch
         
         Args:
             csv_path: Path to the CSV file
             
         Returns:
-            Tuple of (deduplicated prompts list with run_if, raw count before deduplication)
-            Each item in the list is a dict with 'prompt_text' and 'run_if' keys
+            Tuple of (deduplicated prompts list with run_if and branch, raw count before deduplication)
+            Each item in the list is a dict with 'prompt_text', 'run_if', and 'branch' keys
         """
         prompts_raw = []
+        BRANCH_PLACEHOLDER = "BRANCH_CONTROLLED"
         
         try:
             with open(csv_path, 'r', encoding='utf-8') as csvfile:
                 reader = csv.DictReader(csvfile)
                 
-                # Check if Prompts column exists
+                # Check if CSV is valid
                 if reader.fieldnames is None:
                     raise ValueError("CSV file appears to be empty or invalid.")
                 
-                if 'Prompts' not in reader.fieldnames:
+                # Check if Prompts column exists (required for backward compatibility check)
+                # But we'll also accept Branch-only rows
+                has_prompts_column = 'Prompts' in reader.fieldnames
+                has_branch_column = 'Branch' in reader.fieldnames
+                
+                if not has_prompts_column and not has_branch_column:
                     raise ValueError(
-                        f"CSV file is missing required header: 'Prompts'. "
+                        f"CSV file must have at least one of: 'Prompts' or 'Branch' columns. "
                         f"Found columns: {', '.join(reader.fieldnames)}"
                     )
                 
-                # Collect all non-empty prompts with their run_if values
+                # Collect all valid prompt steps (Prompts OR Branch non-empty)
                 for row in reader:
-                    prompt = row.get('Prompts', '').strip()
-                    if prompt:  # Only add non-empty prompts after stripping
-                        run_if = row.get('Run If', '').strip()
+                    prompt = row.get('Prompts', '').strip() if has_prompts_column else ''
+                    branch = row.get('Branch', '').strip() if has_branch_column else ''
+                    
+                    # Row is valid if Prompts OR Branch is non-empty
+                    if prompt or branch:
+                        run_if = row.get('Run If', '').strip() if 'Run If' in reader.fieldnames else ''
+                        
+                        # If Prompts is blank but Branch is present, use placeholder
+                        if not prompt and branch:
+                            prompt_text = BRANCH_PLACEHOLDER
+                        else:
+                            prompt_text = prompt
+                        
                         prompts_raw.append({
-                            'prompt_text': prompt,
-                            'run_if': run_if if run_if else None
+                            'prompt_text': prompt_text,
+                            'run_if': run_if if run_if else None,
+                            'branch': branch if branch else None
                         })
             
             prompts_found_raw = len(prompts_raw)
             
-            # Deduplicate while preserving order (keep first occurrence's run_if)
+            # Deduplicate while preserving order (dedupe on tuple (prompt_text, run_if, branch))
             prompts_seen = set()
             prompts_deduplicated = []
             for prompt_data in prompts_raw:
-                prompt_text = prompt_data['prompt_text']
-                if prompt_text not in prompts_seen:
-                    prompts_seen.add(prompt_text)
+                # Create dedupe key from tuple (prompt_text, run_if, branch)
+                dedupe_key = (
+                    prompt_data['prompt_text'],
+                    prompt_data.get('run_if'),
+                    prompt_data.get('branch')
+                )
+                if dedupe_key not in prompts_seen:
+                    prompts_seen.add(dedupe_key)
                     prompts_deduplicated.append(prompt_data)
             
             return prompts_deduplicated, prompts_found_raw
@@ -147,7 +173,7 @@ class CSVUploader:
         Replace all prompts in public.prompts table with the new prompt list.
         
         Args:
-            prompts: List of prompt dictionaries with 'prompt_text' and 'run_if' keys
+            prompts: List of prompt dictionaries with 'prompt_text', 'run_if', and 'branch' keys
             
         Raises:
             Exception: If upload fails
@@ -169,13 +195,17 @@ class CSVUploader:
             # Prepare insert data
             insert_data = []
             for idx, prompt_data in enumerate(prompts, start=1):
-                insert_data.append({
+                insert_row = {
                     'step_order': idx,
                     'prompt_text': prompt_data['prompt_text'],
                     'run_if': prompt_data.get('run_if'),
                     'is_active': True,
                     'step_name': f'step{idx}'
-                })
+                }
+                # Include branch if present
+                if 'branch' in prompt_data and prompt_data.get('branch'):
+                    insert_row['branch'] = prompt_data['branch']
+                insert_data.append(insert_row)
             
             # Insert new prompts
             insert_response = (

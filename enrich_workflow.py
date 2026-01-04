@@ -106,6 +106,13 @@ class EnrichmentWorkflow:
         self.exa_api_calls_made = 0
         self.exa_api_skipped_because_existing_exa_summary = 0
         self.exa_api_skipped_because_run_exa_false = 0
+        # Branch observability counters
+        self.branch_steps_seen = 0
+        self.branch_steps_matched = 0
+        self.branch_steps_else_taken = 0
+        self.branch_steps_no_match_skipped = 0
+        self.branch_parse_errors = 0
+        self.branch_dependency_skips = 0
         
         # Prompts loaded from database (list of dicts with step_order, prompt_text, run_if)
         self.prompts: List[Dict[str, Any]] = []
@@ -166,27 +173,44 @@ class EnrichmentWorkflow:
         Fetch active prompts from Supabase prompts table, ordered by step_order.
         
         Returns:
-            List of prompt dictionaries with step_order, prompt_text, and run_if in execution order
+            List of prompt dictionaries with step_order, prompt_text, run_if, and branch in execution order
         """
         try:
-            response = (
-                self.supabase.table('prompts')
-                .select('step_order, prompt_text, run_if')
-                .eq('is_active', True)
-                .order('step_order', desc=False)
-                .execute()
-            )
+            # Try to select branch column, but handle gracefully if it doesn't exist
+            try:
+                response = (
+                    self.supabase.table('prompts')
+                    .select('step_order, prompt_text, run_if, branch')
+                    .eq('is_active', True)
+                    .order('step_order', desc=False)
+                    .execute()
+                )
+            except Exception as e:
+                # If branch column doesn't exist, fall back to selecting without it
+                error_str = str(e).lower()
+                if 'column' in error_str and ('does not exist' in error_str or 'not found' in error_str):
+                    print("  [WARNING] 'branch' column not found in prompts table. Continuing without branch support.")
+                    response = (
+                        self.supabase.table('prompts')
+                        .select('step_order, prompt_text, run_if')
+                        .eq('is_active', True)
+                        .order('step_order', desc=False)
+                        .execute()
+                    )
+                else:
+                    raise
             
             if not response.data:
                 return []
             
-            # Extract prompts as dicts with step_order, prompt_text, and run_if
+            # Extract prompts as dicts with step_order, prompt_text, run_if, and branch
             prompts = []
             for row in response.data:
                 prompts.append({
                     'step_order': row.get('step_order'),
                     'prompt_text': row.get('prompt_text', ''),
-                    'run_if': row.get('run_if') or ''  # Convert None to empty string
+                    'run_if': row.get('run_if') or '',  # Convert None to empty string
+                    'branch': row.get('branch') or ''  # Convert None to empty string
                 })
             
             self.prompts_loaded_count = len(prompts)
@@ -536,6 +560,158 @@ class EnrichmentWorkflow:
         
         # Case-insensitive comparison
         return expected_value.lower() in actual_value.lower()
+    
+    def _normalize_whitespace(self, text: str) -> str:
+        """
+        Normalize whitespace: trim leading/trailing, normalize internal runs to single spaces.
+        
+        Args:
+            text: Text to normalize
+            
+        Returns:
+            Normalized text
+        """
+        if not text:
+            return ""
+        # Strip leading/trailing whitespace
+        normalized = text.strip()
+        # Normalize internal whitespace runs to single spaces
+        normalized = ' '.join(normalized.split())
+        return normalized
+    
+    def _parse_branch(self, branch_text: str) -> tuple[str, List[Dict[str, Any]]]:
+        """
+        Parse a Branch DSL string into placeholder and rules.
+        
+        Format:
+        BRANCH({placeholder}):
+        "match1" :: prompt text 1
+        "match2" :: prompt text 2
+        ELSE :: prompt text else
+        
+        Args:
+            branch_text: The branch DSL string
+            
+        Returns:
+            Tuple of (branch_placeholder, rules_list)
+            rules_list contains dicts with keys: 'type' ('match' or 'else'), 'match_value' (for match type), 'prompt_text'
+            
+        Raises:
+            ValueError: If branch_text is malformed
+        """
+        if not branch_text or not branch_text.strip():
+            raise ValueError("Branch text is empty")
+        
+        lines = branch_text.strip().split('\n')
+        rules = []
+        branch_placeholder = None
+        
+        # Find and parse header line: BRANCH({placeholder}):
+        header_found = False
+        for line in lines:
+            line = line.strip()
+            if not line:  # Skip empty lines
+                continue
+            
+            # Check for BRANCH header
+            if line.upper().startswith('BRANCH('):
+                # Extract placeholder from BRANCH({placeholder}):
+                match = re.search(r'BRANCH\(\{(\w+)\}\s*\)\s*:', line, re.IGNORECASE)
+                if not match:
+                    raise ValueError(f"Malformed BRANCH header: {line}. Expected format: BRANCH({{placeholder}}):")
+                branch_placeholder = match.group(1)
+                header_found = True
+                break
+        
+        if not header_found:
+            raise ValueError("Missing BRANCH header. Expected format: BRANCH({placeholder}):")
+        
+        if not branch_placeholder:
+            raise ValueError("Could not extract placeholder from BRANCH header")
+        
+        # Parse rule lines (after header)
+        header_index = -1
+        for i, line in enumerate(lines):
+            if line.strip().upper().startswith('BRANCH('):
+                header_index = i
+                break
+        
+        if header_index == -1:
+            raise ValueError("Could not find BRANCH header line")
+        
+        # Process lines after header
+        for line in lines[header_index + 1:]:
+            line = line.strip()
+            if not line:  # Skip empty lines
+                continue
+            
+            # Check for ELSE rule (case-insensitive)
+            if line.upper().startswith('ELSE'):
+                # Parse ELSE :: prompt_text
+                else_match = re.match(r'ELSE\s*::\s*(.*)', line, re.IGNORECASE | re.DOTALL)
+                if not else_match:
+                    raise ValueError(f"Malformed ELSE rule: {line}. Expected format: ELSE :: prompt_text")
+                prompt_text = else_match.group(1).strip()
+                rules.append({
+                    'type': 'else',
+                    'prompt_text': prompt_text
+                })
+            else:
+                # Parse match rule: "match" :: prompt_text
+                match_rule = re.match(r'"([^"]+)"\s*::\s*(.*)', line, re.DOTALL)
+                if not match_rule:
+                    raise ValueError(f"Malformed match rule: {line}. Expected format: \"match\" :: prompt_text")
+                match_value = match_rule.group(1)
+                prompt_text = match_rule.group(2).strip()
+                rules.append({
+                    'type': 'match',
+                    'match_value': match_value,
+                    'prompt_text': prompt_text
+                })
+        
+        if not rules:
+            raise ValueError("No rules found in branch (must have at least one match rule or ELSE rule)")
+        
+        return branch_placeholder, rules
+    
+    def _select_branch_prompt(self, parsed_branch: tuple[str, List[Dict[str, Any]]], variables: Dict[str, str]) -> tuple[Optional[str], Optional[str]]:
+        """
+        Select a prompt from parsed branch rules based on variable values.
+        
+        Args:
+            parsed_branch: Tuple of (branch_placeholder, rules_list) from _parse_branch
+            variables: Dictionary of variable names to values
+            
+        Returns:
+            Tuple of (selected_prompt_text, rule_type) where rule_type is 'match', 'else', or None
+            Returns (None, None) if no match and no ELSE
+        """
+        branch_placeholder, rules = parsed_branch
+        
+        # Get the branch variable value
+        branch_value = variables.get(branch_placeholder, '')
+        
+        # Normalize branch value: trim and normalize whitespace
+        normalized_branch_value = self._normalize_whitespace(branch_value).lower()
+        
+        # Try to match rules in order (first match wins)
+        for rule in rules:
+            if rule['type'] == 'match':
+                # Normalize match value
+                normalized_match = self._normalize_whitespace(rule['match_value']).lower()
+                
+                # Case-insensitive contains match
+                if normalized_match in normalized_branch_value:
+                    return (rule['prompt_text'], 'match')
+            # else rules are handled after all match rules
+        
+        # No match found - check for ELSE rule
+        for rule in rules:
+            if rule['type'] == 'else':
+                return (rule['prompt_text'], 'else')
+        
+        # No match and no ELSE
+        return (None, None)
     
     def _is_blank(self, value: Any) -> bool:
         """
@@ -1053,27 +1229,9 @@ class EnrichmentWorkflow:
                     prompt_dict = self.prompts[step_num - 1]  # 0-indexed
                     prompt_template = prompt_dict['prompt_text']
                     run_if = prompt_dict.get('run_if', '') or ''
+                    branch = prompt_dict.get('branch', '') or ''
                     
-                    # MASTER DEPENDENCY RULE: Check if any placeholder in prompt_text resolves to empty string
-                    placeholders = self._extract_placeholders(prompt_template)
-                    has_empty_dependency = False
-                    empty_dependencies = []
-                    
-                    for placeholder in placeholders:
-                        placeholder_value = variables.get(placeholder, '')
-                        # Treat None/blank as empty string
-                        if not placeholder_value or not str(placeholder_value).strip():
-                            has_empty_dependency = True
-                            empty_dependencies.append(placeholder)
-                    
-                    if has_empty_dependency:
-                        # Skip this step - set output to empty string and continue
-                        print(f"  [SKIP DEPENDENCY] Prospect {prospect_id} (run_id: {self.run_id}) step={step_num} missing dependencies: {','.join(empty_dependencies)}")
-                        cached_step_outputs[step_num] = ""  # Set to empty string
-                        self.steps_skipped_missing_dependencies += 1
-                        continue  # Continue to next step
-                    
-                    # Parse and evaluate run_if condition
+                    # Parse and evaluate run_if condition (OUTER GATE - evaluated before Branch)
                     try:
                         run_if_parsed = self._parse_run_if(run_if)
                         run_if_passes = self._evaluate_run_if(run_if_parsed, variables)
@@ -1101,14 +1259,95 @@ class EnrichmentWorkflow:
                         return
                     
                     if not run_if_passes:
-                        # run_if evaluated to False - skip this step
+                        # run_if evaluated to False - skip this step (Branch is NOT evaluated)
                         print(f"  [SKIP RUN_IF] Prospect {prospect_id} (run_id: {self.run_id}) step={step_num} run_if condition not met")
                         cached_step_outputs[step_num] = ""  # Set to empty string
                         self.steps_skipped_run_if_false += 1
                         continue  # Continue to next step
                     
-                    # Both dependency rule and run_if passed - run the step
-                    step_result = await self._run_enrichment_step(step_num, prompt_template, variables)
+                    # Run If passed - now handle Branch selection (if present)
+                    selected_prompt_template = prompt_template  # Default to original prompt_text
+                    
+                    if branch:
+                        # Branch is present - parse and select prompt
+                        self.branch_steps_seen += 1
+                        try:
+                            parsed_branch = self._parse_branch(branch)
+                            selected_prompt, rule_type = self._select_branch_prompt(parsed_branch, variables)
+                            
+                            if selected_prompt is None:
+                                # No match and no ELSE - skip step
+                                print(f"  [SKIP BRANCH] Prospect {prospect_id} (run_id: {self.run_id}) step={step_num} no branch match and no ELSE")
+                                cached_step_outputs[step_num] = ""  # Set to empty string
+                                self.branch_steps_no_match_skipped += 1
+                                continue  # Continue to next step
+                            
+                            if selected_prompt == "":
+                                # Selected prompt is empty string - skip step
+                                print(f"  [SKIP BRANCH] Prospect {prospect_id} (run_id: {self.run_id}) step={step_num} branch selected empty string")
+                                cached_step_outputs[step_num] = ""  # Set to empty string
+                                if rule_type == 'match':
+                                    self.branch_steps_matched += 1
+                                elif rule_type == 'else':
+                                    self.branch_steps_else_taken += 1
+                                continue  # Continue to next step
+                            
+                            # Track which rule type was selected
+                            if rule_type == 'match':
+                                self.branch_steps_matched += 1
+                            elif rule_type == 'else':
+                                self.branch_steps_else_taken += 1
+                            
+                            # Use selected prompt from branch
+                            selected_prompt_template = selected_prompt
+                            
+                        except ValueError as e:
+                            # Malformed branch - block the prospect
+                            branch_error_msg = str(e)
+                            malformed_reason = f"Branch parse error at step {step_num}: {branch_error_msg}"
+                            print(f"  [BLOCKED] Prospect {prospect_id} (run_id: {self.run_id}) website={normalized_website} step={step_num} - {malformed_reason}")
+                            self.branch_parse_errors += 1
+                            
+                            # Persist blocked status to DB immediately
+                            write_success = await self._write_prospect_with_retry(
+                                prospect_id,
+                                cached_exa_summary,
+                                cached_company_summary,
+                                {},  # Empty dict - do not overwrite existing step outputs
+                                'blocked',
+                                db_write_semaphore,
+                                blocked_reason=malformed_reason
+                            )
+                            
+                            if not write_success:
+                                print(f"  [ERROR] Failed to write blocked status for prospect {prospect_id}")
+                            
+                            # Exit processing for this prospect (no further steps attempted)
+                            return
+                    
+                    # Now check dependencies on the selected prompt (after branch selection)
+                    placeholders = self._extract_placeholders(selected_prompt_template)
+                    has_empty_dependency = False
+                    empty_dependencies = []
+                    
+                    for placeholder in placeholders:
+                        placeholder_value = variables.get(placeholder, '')
+                        # Treat None/blank as empty string
+                        if not placeholder_value or not str(placeholder_value).strip():
+                            has_empty_dependency = True
+                            empty_dependencies.append(placeholder)
+                    
+                    if has_empty_dependency:
+                        # Skip this step - set output to empty string and continue
+                        print(f"  [SKIP DEPENDENCY] Prospect {prospect_id} (run_id: {self.run_id}) step={step_num} missing dependencies: {','.join(empty_dependencies)}")
+                        cached_step_outputs[step_num] = ""  # Set to empty string
+                        self.steps_skipped_missing_dependencies += 1
+                        if branch:
+                            self.branch_dependency_skips += 1
+                        continue  # Continue to next step
+                    
+                    # All checks passed - run the step with selected prompt
+                    step_result = await self._run_enrichment_step(step_num, selected_prompt_template, variables)
                     
                     if not step_result:
                         # Step failed after all retries - this is a final failure
@@ -1614,6 +1853,13 @@ class EnrichmentWorkflow:
         print(f"db_write_failures: {self.db_write_failures}")
         print(f"rows_claimed: {self.rows_claimed}")
         print(f"rows_skipped_already_claimed: {self.rows_skipped_already_claimed}")
+        # Branch observability counters
+        print(f"branch_steps_seen: {self.branch_steps_seen}")
+        print(f"branch_steps_matched: {self.branch_steps_matched}")
+        print(f"branch_steps_else_taken: {self.branch_steps_else_taken}")
+        print(f"branch_steps_no_match_skipped: {self.branch_steps_no_match_skipped}")
+        print(f"branch_parse_errors: {self.branch_parse_errors}")
+        print(f"branch_dependency_skips: {self.branch_dependency_skips}")
         print("=" * 60)
 
 
