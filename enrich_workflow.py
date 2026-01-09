@@ -261,16 +261,16 @@ class EnrichmentWorkflow:
         offset = 0
         fetch_batch_size = 1000
         
-            while True:
-                try:
-                    response = (
-                        self.supabase.table('prospects')
-                        .select('id, website')
-                        .eq('project_id', self.project_id)
-                        .range(offset, offset + fetch_batch_size - 1)
-                        .execute()
-                    )
-                
+        while True:
+            try:
+                response = (
+                    self.supabase.table('prospects')
+                    .select('id, website')
+                    .eq('project_id', self.project_id)
+                    .range(offset, offset + fetch_batch_size - 1)
+                    .execute()
+                )
+            
                 if not response.data:
                     break
                 
@@ -369,17 +369,17 @@ class EnrichmentWorkflow:
         remaining_prospects = []
         offset = 0
         
-            while True:
-                try:
-                    response = (
-                        self.supabase.table('prospects')
-                        .select('id, website')
-                        .eq('project_id', self.project_id)
-                        .order('id', desc=False)  # Order by id ascending (oldest first)
-                        .range(offset, offset + fetch_batch_size - 1)
-                        .execute()
-                    )
-                
+        while True:
+            try:
+                response = (
+                    self.supabase.table('prospects')
+                    .select('id, website')
+                    .eq('project_id', self.project_id)
+                    .order('id', desc=False)  # Order by id ascending (oldest first)
+                    .range(offset, offset + fetch_batch_size - 1)
+                    .execute()
+                )
+            
                 if not response.data:
                     break
                 
