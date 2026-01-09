@@ -9,7 +9,7 @@ import csv
 import os
 import sys
 import uuid
-from typing import Set, List, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
