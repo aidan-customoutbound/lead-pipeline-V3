@@ -44,8 +44,16 @@ DEFAULT_MAX_TOKENS = 250
 class EnrichmentWorkflow:
     """Handles the enrichment workflow for prospect websites."""
     
-    def __init__(self):
-        """Initialize global clients for Supabase, Exa.AI, and OpenRouter (reused across all batches)."""
+    def __init__(self, project_id: str):
+        """
+        Initialize global clients for Supabase, Exa.AI, and OpenRouter (reused across all batches).
+        
+        Args:
+            project_id: Project ID to scope all operations (required)
+        """
+        if not project_id:
+            raise ValueError("project_id is required and cannot be empty")
+        
         required_vars = [SUPABASE_URL, SUPABASE_KEY, OPENROUTER_API_KEY]
         if RUN_EXA:
             required_vars.append(EXA_API_KEY)
@@ -65,6 +73,8 @@ class EnrichmentWorkflow:
                 f"Missing required environment variables: {', '.join(missing)}. "
                 "Please check your .env file."
             )
+        
+        self.project_id = project_id
         
         # Initialize global Supabase client (reused across all batches)
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -119,6 +129,12 @@ class EnrichmentWorkflow:
         
         # Run ID for idempotency within this run
         self.run_id = None
+        
+        # Run token for supersession detection (set from first fetched row)
+        self.run_token = None
+        
+        # Flag to track if run was superseded
+        self.run_superseded = False
     
     def _normalize_website(self, website: str) -> str:
         """
@@ -182,6 +198,7 @@ class EnrichmentWorkflow:
                     self.supabase.table('prompts')
                     .select('step_order, prompt_text, run_if, branch')
                     .eq('is_active', True)
+                    .eq('project_id', self.project_id)
                     .order('step_order', desc=False)
                     .execute()
                 )
@@ -194,6 +211,7 @@ class EnrichmentWorkflow:
                         self.supabase.table('prompts')
                         .select('step_order, prompt_text, run_if')
                         .eq('is_active', True)
+                        .eq('project_id', self.project_id)
                         .order('step_order', desc=False)
                         .execute()
                     )
@@ -243,14 +261,15 @@ class EnrichmentWorkflow:
         offset = 0
         fetch_batch_size = 1000
         
-        while True:
-            try:
-                response = (
-                    self.supabase.table('prospects')
-                    .select('id, website')
-                    .range(offset, offset + fetch_batch_size - 1)
-                    .execute()
-                )
+            while True:
+                try:
+                    response = (
+                        self.supabase.table('prospects')
+                        .select('id, website')
+                        .eq('project_id', self.project_id)
+                        .range(offset, offset + fetch_batch_size - 1)
+                        .execute()
+                    )
                 
                 if not response.data:
                     break
@@ -350,15 +369,16 @@ class EnrichmentWorkflow:
         remaining_prospects = []
         offset = 0
         
-        while True:
-            try:
-                response = (
-                    self.supabase.table('prospects')
-                    .select('id, website')
-                    .order('id', desc=False)  # Order by id ascending (oldest first)
-                    .range(offset, offset + fetch_batch_size - 1)
-                    .execute()
-                )
+            while True:
+                try:
+                    response = (
+                        self.supabase.table('prospects')
+                        .select('id, website')
+                        .eq('project_id', self.project_id)
+                        .order('id', desc=False)  # Order by id ascending (oldest first)
+                        .range(offset, offset + fetch_batch_size - 1)
+                        .execute()
+                    )
                 
                 if not response.data:
                     break
@@ -433,6 +453,7 @@ class EnrichmentWorkflow:
             response = (
                 self.supabase.table('prospects')
                 .select('id')
+                .eq('project_id', self.project_id)
                 .limit(1)
                 .execute()
             )
@@ -1003,6 +1024,7 @@ class EnrichmentWorkflow:
                     self.supabase.table('prospects')
                     .select('id, status, exa_summary, company_summary, step1_output, step2_output, step3_output, step4_output, step5_output')
                     .eq('id', prospect_id)
+                    .eq('project_id', self.project_id)
                     .execute()
                 )
             
@@ -1113,6 +1135,7 @@ class EnrichmentWorkflow:
                             self.supabase.table('prospects')
                             .update(update_data)
                             .eq('id', prospect_id)
+                            .eq('project_id', self.project_id)
                             .execute()
                         )
                     
@@ -1456,7 +1479,7 @@ class EnrichmentWorkflow:
     def _claim_rows_atomically(self, row_ids: List[Any]) -> List[Any]:
         """
         Atomically claim rows by setting processing_run_id and processing_started_at.
-        Only claims rows that are still eligible (status='new' AND (processing_run_id IS NULL OR processing_started_at < now() - interval '30 minutes')).
+        Only claims rows that are still eligible (status='new' AND project_id matches AND run_token matches AND (processing_run_id IS NULL OR processing_started_at < now() - interval '30 minutes')).
         Uses UPDATE ... RETURNING id to ensure 100% atomic and provably safe claiming.
         
         Args:
@@ -1465,7 +1488,7 @@ class EnrichmentWorkflow:
         Returns:
             List of row IDs that were successfully claimed (only IDs returned from UPDATE ... RETURNING)
         """
-        if not row_ids or not self.run_id:
+        if not row_ids or not self.run_id or not self.run_token:
             return []
         
         print("[CLAIM] Using update().execute() without select() (compat mode)")
@@ -1489,14 +1512,16 @@ class EnrichmentWorkflow:
         for row_id in row_ids:
             row_claimed = False
             
-            # Attempt A: Update rows where status='new' AND processing_run_id IS NULL
-            where_a = f"id={row_id} AND status='new' AND processing_run_id IS NULL"
+            # Attempt A: Update rows where status='new' AND processing_run_id IS NULL AND project_id matches AND run_token matches
+            where_a = f"id={row_id} AND status='new' AND processing_run_id IS NULL AND project_id='{self.project_id}' AND run_token='{self.run_token}'"
             try:
                 response = (
                     self.supabase.table('prospects')
                     .update(update_data)
                     .eq('id', row_id)
                     .eq('status', 'new')
+                    .eq('project_id', self.project_id)
+                    .eq('run_token', self.run_token)
                     .is_('processing_run_id', 'null')
                     .execute()
                 )
@@ -1574,14 +1599,16 @@ class EnrichmentWorkflow:
             if row_claimed:
                 continue
             
-            # Attempt B: Update rows where status='new' AND processing_started_at < thirty_min_ago
-            where_b = f"id={row_id} AND status='new' AND processing_started_at<'{thirty_min_ago}'"
+            # Attempt B: Update rows where status='new' AND processing_started_at < thirty_min_ago AND project_id matches AND run_token matches
+            where_b = f"id={row_id} AND status='new' AND processing_started_at<'{thirty_min_ago}' AND project_id='{self.project_id}' AND run_token='{self.run_token}'"
             try:
                 response = (
                     self.supabase.table('prospects')
                     .update(update_data)
                     .eq('id', row_id)
                     .eq('status', 'new')
+                    .eq('project_id', self.project_id)
+                    .eq('run_token', self.run_token)
                     .lt('processing_started_at', thirty_min_ago)
                     .execute()
                 )
@@ -1667,8 +1694,11 @@ class EnrichmentWorkflow:
     def fetch_batch(self, limit: int = BATCH_SIZE) -> list:
         """
         Fetch a batch of prospects with status 'new' from Supabase and atomically claim them.
-        Only fetches rows that are eligible: status='new' AND (processing_run_id IS NULL OR processing_started_at < now() - interval '30 minutes').
+        Only fetches rows that are eligible: status='new' AND project_id matches AND run_token matches AND (processing_run_id IS NULL OR processing_started_at < now() - interval '30 minutes').
         Also fetch existing step outputs to support "only fill blanks" logic.
+        
+        Sets run_token from first row if not already set.
+        Detects superseded runs (different run_token) and exits gracefully.
         
         Returns ONLY rows whose IDs were returned from UPDATE ... RETURNING id in _claim_rows_atomically().
         No inference of success - relies exclusively on returned IDs.
@@ -1678,6 +1708,7 @@ class EnrichmentWorkflow:
             
         Returns:
             List of prospect dictionaries (only rows that were successfully claimed via UPDATE ... RETURNING)
+            Returns empty list if run is superseded
         """
         if not self.run_id:
             print("Error: run_id not set. Cannot claim rows.")
@@ -1687,18 +1718,19 @@ class EnrichmentWorkflow:
             # Calculate 30 minutes ago for eligibility check
             thirty_min_ago = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
             
-            # Fetch eligible rows: status='new' AND (processing_run_id IS NULL OR processing_started_at < thirty_min_ago)
+            # Fetch eligible rows: status='new' AND project_id matches AND (processing_run_id IS NULL OR processing_started_at < thirty_min_ago)
             # We'll fetch a larger batch to account for rows that might not be claimable
             # Then we'll claim them atomically and return only the claimed ones
             
-            # First, fetch rows with status='new' that are potentially eligible
+            # First, fetch rows with status='new' for this project_id that are potentially eligible
             # We'll fetch more than limit to account for rows that might be claimed by other runs
             fetch_limit = limit * 2  # Fetch 2x to account for potential conflicts
             
             response = (
                 self.supabase.table('prospects')
-                .select('id, website, short_description, exa_summary, company_summary, step1_output, step2_output, step3_output, step4_output, step5_output, processing_run_id, processing_started_at')
+                .select('id, website, short_description, exa_summary, company_summary, step1_output, step2_output, step3_output, step4_output, step5_output, processing_run_id, processing_started_at, run_token')
                 .eq('status', 'new')
+                .eq('project_id', self.project_id)
                 .limit(fetch_limit)
                 .execute()
             )
@@ -1706,16 +1738,34 @@ class EnrichmentWorkflow:
             if not response.data:
                 return []
             
-            # Filter to only eligible rows (processing_run_id IS NULL OR processing_started_at < thirty_min_ago)
+            # Set run_token from first row if not already set
+            if self.run_token is None:
+                first_row = response.data[0]
+                row_run_token = first_row.get('run_token')
+                if row_run_token:
+                    self.run_token = row_run_token
+                    print(f"Using run_token={self.run_token} from first fetched row")
+                else:
+                    print("WARNING: First row has no run_token. This may indicate schema not ready.")
+            
+            # Filter to only eligible rows with matching run_token
             eligible_rows = []
             for row in response.data:
+                row_run_token = row.get('run_token')
                 processing_run_id = row.get('processing_run_id')
                 processing_started_at = row.get('processing_started_at')
                 
-                # Check eligibility: NULL processing_run_id OR old processing_started_at
+                # Check if run is superseded (different run_token)
+                if row_run_token and self.run_token and row_run_token != self.run_token:
+                    print(f"Run superseded — exiting. project_id={self.project_id} run_token={self.run_token} (found run_token={row_run_token})")
+                    self.run_superseded = True
+                    return []  # Return empty list to exit gracefully
+                
+                # Check eligibility: matching run_token AND (NULL processing_run_id OR old processing_started_at)
                 is_eligible = (
-                    processing_run_id is None or
-                    (processing_started_at and processing_started_at < thirty_min_ago)
+                    (not row_run_token or row_run_token == self.run_token) and
+                    (processing_run_id is None or
+                     (processing_started_at and processing_started_at < thirty_min_ago))
                 )
                 
                 if is_eligible:
@@ -1759,6 +1809,7 @@ class EnrichmentWorkflow:
         
         print("=" * 60)
         print("Starting enrichment workflow (Production Mode)")
+        print(f"Using project_id={self.project_id}")
         print(f"Run ID: {self.run_id}")
         print("=" * 60)
         
@@ -1828,9 +1879,12 @@ class EnrichmentWorkflow:
             print(f"\n[Batch {batch_number}] Fetching {BATCH_SIZE} prospects with status='new'...")
             batch = self.fetch_batch(BATCH_SIZE)
             
-            # If no rows returned, we're done
+            # If no rows returned, check if we were superseded
             if not batch:
-                print(f"[Batch {batch_number}] No more prospects to process. Job complete!")
+                if self.run_superseded:
+                    print(f"[Batch {batch_number}] Run superseded — exiting gracefully. project_id={self.project_id} run_token={self.run_token}")
+                else:
+                    print(f"[Batch {batch_number}] No more prospects to process. Job complete!")
                 break
             
             # Filter out prospects whose normalized website is already in failed_this_run
@@ -1925,9 +1979,23 @@ class EnrichmentWorkflow:
 
 async def main():
     """Entry point for the script."""
+    # Get project_id from command line or environment variable
+    import sys
+    project_id = None
+    if len(sys.argv) > 1:
+        project_id = sys.argv[1]
+    else:
+        project_id = os.getenv("PROJECT_ID")
+    
+    if not project_id:
+        print("ERROR: project_id is required.")
+        print("Usage: python enrich_workflow.py <project_id>")
+        print("   OR: Set PROJECT_ID environment variable")
+        sys.exit(1)
+    
     try:
         # Initialize workflow (creates global clients)
-        workflow = EnrichmentWorkflow()
+        workflow = EnrichmentWorkflow(project_id)
         # Run batch processing
         await workflow.run()
     except ValueError as e:

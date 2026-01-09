@@ -8,6 +8,7 @@ skipping duplicates. It also uploads prompts from the Prompts column to the publ
 import csv
 import os
 import sys
+import uuid
 from typing import Set, List, Dict, Optional
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -24,8 +25,16 @@ INPUT_CSV = "input.csv"
 class CSVUploader:
     """Handles CSV upload to Supabase prospects table and prompts table."""
     
-    def __init__(self):
-        """Initialize Supabase client."""
+    def __init__(self, project_id: str):
+        """
+        Initialize Supabase client.
+        
+        Args:
+            project_id: Project ID to scope all operations (required)
+        """
+        if not project_id:
+            raise ValueError("project_id is required and cannot be empty")
+        
         if not all([SUPABASE_URL, SUPABASE_KEY]):
             raise ValueError(
                 "Missing required environment variables. "
@@ -36,6 +45,7 @@ class CSVUploader:
         # Initialize Supabase client
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         self.has_prompts_column: Optional[bool] = None
+        self.project_id = project_id
     
     def test_connection(self) -> bool:
         """
@@ -179,12 +189,11 @@ class CSVUploader:
             Exception: If upload fails
         """
         try:
-            # Delete all existing prompts
-            # Use a condition that matches all rows (step_order >= 0 should match all valid rows)
+            # Delete all existing prompts for this project_id
             delete_response = (
                 self.supabase.table('prompts')
                 .delete()
-                .gte('step_order', 0)
+                .eq('project_id', self.project_id)
                 .execute()
             )
             
@@ -200,7 +209,8 @@ class CSVUploader:
                     'prompt_text': prompt_data['prompt_text'],
                     'run_if': prompt_data.get('run_if'),
                     'is_active': True,
-                    'step_name': f'step{idx}'
+                    'step_name': f'step{idx}',
+                    'project_id': self.project_id
                 }
                 # Include branch if present
                 if 'branch' in prompt_data and prompt_data.get('branch'):
@@ -219,7 +229,7 @@ class CSVUploader:
     
     def get_existing_websites(self) -> Set[str]:
         """
-        Fetch all existing websites from the prospects table.
+        Fetch all existing websites from the prospects table for this project_id.
         
         Returns:
             Set of existing website strings (normalized)
@@ -233,6 +243,7 @@ class CSVUploader:
                 response = (
                     self.supabase.table('prospects')
                     .select('website')
+                    .eq('project_id', self.project_id)
                     .range(offset, offset + batch_size - 1)
                     .execute()
                 )
@@ -367,14 +378,15 @@ class CSVUploader:
         except Exception as e:
             raise Exception(f"Error reading CSV file: {str(e)}")
     
-    def upload_rows(self, rows: List[Dict[str, str]], existing_websites: Set[str]) -> tuple[int, int, int, int, int, int]:
+    def upload_rows(self, rows: List[Dict[str, str]], existing_websites: Set[str], run_token: str) -> tuple[int, int, int, int, int, int]:
         """
         Upload new rows to Supabase, skipping duplicates.
         Also updates existing rows with exa_summary if CSV Exa is non-blank.
         
         Args:
             rows: List of row dictionaries with website, short_description, exa
-            existing_websites: Set of normalized existing websites
+            existing_websites: Set of normalized existing websites (project-specific)
+            run_token: Run token to attach to all inserted rows
             
         Returns:
             Tuple of (inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count, exa_overwrites_applied, exa_values_used_for_new_rows)
@@ -417,7 +429,9 @@ class CSVUploader:
                 insert_data = {
                     'website': normalized,
                     'short_description': row['short_description'],
-                    'status': 'new'
+                    'status': 'new',
+                    'project_id': self.project_id,
+                    'run_token': run_token
                 }
                 
                 # Include exa_summary if Exa is non-blank
@@ -434,11 +448,12 @@ class CSVUploader:
             print(f"Applying {len(updates_to_apply)} Exa overwrites to existing rows...")
             for normalized_website, exa_summary in updates_to_apply:
                 try:
-                    # Update the existing row by normalized website
+                    # Update the existing row by normalized website and project_id
                     response = (
                         self.supabase.table('prospects')
                         .update({'exa_summary': exa_summary})
                         .eq('website', normalized_website)
+                        .eq('project_id', self.project_id)
                         .execute()
                     )
                     exa_overwrites_applied += 1
@@ -471,7 +486,12 @@ class CSVUploader:
     
     def run(self) -> None:
         """Main upload workflow execution."""
+        # Generate run token at the start
+        current_run_token = str(uuid.uuid4())
+        
         print("Starting CSV upload workflow...")
+        print(f"Using project_id={self.project_id}")
+        print(f"Using run_token={current_run_token}")
         print("-" * 50)
         
         # Test connection
@@ -528,7 +548,23 @@ class CSVUploader:
         
         print("-" * 50)
         
-        # Fetch existing websites
+        # Delete all existing prospects for this project_id (wipe-and-replace behavior)
+        print(f"Deleting existing prospects for project_id={self.project_id}...")
+        try:
+            delete_response = (
+                self.supabase.table('prospects')
+                .delete()
+                .eq('project_id', self.project_id)
+                .execute()
+            )
+            print(f"Deleted existing prospects for project_id={self.project_id}")
+        except Exception as e:
+            print(f"Error deleting existing prospects: {str(e)}")
+            # Continue anyway - may be schema not ready yet
+        
+        print("-" * 50)
+        
+        # Fetch existing websites (should be empty after delete, but check for safety)
         print("Checking for existing websites in database...")
         existing_websites = self.get_existing_websites()
         print(f"Found {len(existing_websites)} existing websites in database")
@@ -537,7 +573,7 @@ class CSVUploader:
         
         # Upload new rows
         print("Uploading new rows...")
-        inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count, exa_overwrites_applied, exa_values_used_for_new_rows = self.upload_rows(rows, existing_websites)
+        inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count, exa_overwrites_applied, exa_values_used_for_new_rows = self.upload_rows(rows, existing_websites, current_run_token)
         
         print("-" * 50)
         print("Upload Summary:")
@@ -548,13 +584,27 @@ class CSVUploader:
         print(f"  Rows failed: {failed_count}")
         print(f"  exa_overwrites_applied: {exa_overwrites_applied}")
         print(f"  exa_values_used_for_new_rows: {exa_values_used_for_new_rows}")
+        print(f"Uploaded project={self.project_id} run_token={current_run_token} rows={inserted_count}")
         print("Upload workflow completed!")
 
 
 def main():
     """Entry point for the script."""
+    # Get project_id from command line or environment variable
+    project_id = None
+    if len(sys.argv) > 1:
+        project_id = sys.argv[1]
+    else:
+        project_id = os.getenv("PROJECT_ID")
+    
+    if not project_id:
+        print("ERROR: project_id is required.")
+        print("Usage: python upload_csv.py <project_id>")
+        print("   OR: Set PROJECT_ID environment variable")
+        sys.exit(1)
+    
     try:
-        uploader = CSVUploader()
+        uploader = CSVUploader(project_id)
         uploader.run()
     except ValueError as e:
         print(f"Configuration error: {str(e)}")
