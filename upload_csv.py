@@ -97,6 +97,80 @@ class CSVUploader:
             self.has_prompts_column = True
             return True
     
+    def extract_prompts_from_rows(self, csv_rows: List[Dict[str, str]]) -> tuple[List[Dict[str, str]], int]:
+        """
+        Extract and normalize prompts, run_if, and branch from the Prompts, Run If, and Branch columns in CSV rows.
+        
+        Supports "Branch-only" steps: a row is considered a valid prompt step if it has:
+        - non-blank Prompts OR
+        - non-blank Branch
+        
+        Args:
+            csv_rows: List of CSV row dictionaries (from DictReader)
+            
+        Returns:
+            Tuple of (deduplicated prompts list with run_if and branch, raw count before deduplication)
+            Each item in the list is a dict with 'prompt_text', 'run_if', and 'branch' keys
+        """
+        prompts_raw = []
+        BRANCH_PLACEHOLDER = "BRANCH_CONTROLLED"
+        
+        if not csv_rows:
+            raise ValueError("CSV rows list is empty or invalid.")
+        
+        # Get fieldnames from first row keys
+        fieldnames = list(csv_rows[0].keys()) if csv_rows else []
+        
+        # Check if Prompts column exists (required for backward compatibility check)
+        # But we'll also accept Branch-only rows
+        has_prompts_column = 'Prompts' in fieldnames
+        has_branch_column = 'Branch' in fieldnames
+        
+        if not has_prompts_column and not has_branch_column:
+            raise ValueError(
+                f"CSV rows must have at least one of: 'Prompts' or 'Branch' columns. "
+                f"Found columns: {', '.join(fieldnames)}"
+            )
+        
+        # Collect all valid prompt steps (Prompts OR Branch non-empty)
+        for row in csv_rows:
+            prompt = row.get('Prompts', '').strip() if has_prompts_column else ''
+            branch = row.get('Branch', '').strip() if has_branch_column else ''
+            
+            # Row is valid if Prompts OR Branch is non-empty
+            if prompt or branch:
+                run_if = row.get('Run If', '').strip() if 'Run If' in fieldnames else ''
+                
+                # If Prompts is blank but Branch is present, use placeholder
+                if not prompt and branch:
+                    prompt_text = BRANCH_PLACEHOLDER
+                else:
+                    prompt_text = prompt
+                
+                prompts_raw.append({
+                    'prompt_text': prompt_text,
+                    'run_if': run_if if run_if else None,
+                    'branch': branch if branch else None
+                })
+        
+        prompts_found_raw = len(prompts_raw)
+        
+        # Deduplicate while preserving order (dedupe on tuple (prompt_text, run_if, branch))
+        prompts_seen = set()
+        prompts_deduplicated = []
+        for prompt_data in prompts_raw:
+            # Create dedupe key from tuple (prompt_text, run_if, branch)
+            dedupe_key = (
+                prompt_data['prompt_text'],
+                prompt_data.get('run_if'),
+                prompt_data.get('branch')
+            )
+            if dedupe_key not in prompts_seen:
+                prompts_seen.add(dedupe_key)
+                prompts_deduplicated.append(prompt_data)
+        
+        return prompts_deduplicated, prompts_found_raw
+    
     def extract_prompts_from_csv(self, csv_path: str) -> tuple[List[Dict[str, str]], int]:
         """
         Extract and normalize prompts, run_if, and branch from the Prompts, Run If, and Branch columns in the CSV.
@@ -112,9 +186,6 @@ class CSVUploader:
             Tuple of (deduplicated prompts list with run_if and branch, raw count before deduplication)
             Each item in the list is a dict with 'prompt_text', 'run_if', and 'branch' keys
         """
-        prompts_raw = []
-        BRANCH_PLACEHOLDER = "BRANCH_CONTROLLED"
-        
         try:
             with open(csv_path, 'r', encoding='utf-8') as csvfile:
                 reader = csv.DictReader(csvfile)
@@ -123,55 +194,11 @@ class CSVUploader:
                 if reader.fieldnames is None:
                     raise ValueError("CSV file appears to be empty or invalid.")
                 
-                # Check if Prompts column exists (required for backward compatibility check)
-                # But we'll also accept Branch-only rows
-                has_prompts_column = 'Prompts' in reader.fieldnames
-                has_branch_column = 'Branch' in reader.fieldnames
+                # Convert reader to list of dicts
+                csv_rows = list(reader)
                 
-                if not has_prompts_column and not has_branch_column:
-                    raise ValueError(
-                        f"CSV file must have at least one of: 'Prompts' or 'Branch' columns. "
-                        f"Found columns: {', '.join(reader.fieldnames)}"
-                    )
-                
-                # Collect all valid prompt steps (Prompts OR Branch non-empty)
-                for row in reader:
-                    prompt = row.get('Prompts', '').strip() if has_prompts_column else ''
-                    branch = row.get('Branch', '').strip() if has_branch_column else ''
-                    
-                    # Row is valid if Prompts OR Branch is non-empty
-                    if prompt or branch:
-                        run_if = row.get('Run If', '').strip() if 'Run If' in reader.fieldnames else ''
-                        
-                        # If Prompts is blank but Branch is present, use placeholder
-                        if not prompt and branch:
-                            prompt_text = BRANCH_PLACEHOLDER
-                        else:
-                            prompt_text = prompt
-                        
-                        prompts_raw.append({
-                            'prompt_text': prompt_text,
-                            'run_if': run_if if run_if else None,
-                            'branch': branch if branch else None
-                        })
-            
-            prompts_found_raw = len(prompts_raw)
-            
-            # Deduplicate while preserving order (dedupe on tuple (prompt_text, run_if, branch))
-            prompts_seen = set()
-            prompts_deduplicated = []
-            for prompt_data in prompts_raw:
-                # Create dedupe key from tuple (prompt_text, run_if, branch)
-                dedupe_key = (
-                    prompt_data['prompt_text'],
-                    prompt_data.get('run_if'),
-                    prompt_data.get('branch')
-                )
-                if dedupe_key not in prompts_seen:
-                    prompts_seen.add(dedupe_key)
-                    prompts_deduplicated.append(prompt_data)
-            
-            return prompts_deduplicated, prompts_found_raw
+                # Use the row-based extraction method
+                return self.extract_prompts_from_rows(csv_rows)
             
         except FileNotFoundError:
             raise FileNotFoundError(f"CSV file not found: {csv_path}")
@@ -332,6 +359,47 @@ class CSVUploader:
         
         return False
     
+    def parse_csv_rows(self, csv_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """
+        Parse CSV rows into prospect format.
+        
+        Args:
+            csv_rows: List of CSV row dictionaries (from DictReader)
+            
+        Returns:
+            List of dictionaries with 'website', 'short_description', 'exa' keys
+        """
+        rows = []
+        
+        if not csv_rows:
+            raise ValueError("CSV rows list is empty or invalid.")
+        
+        # Get fieldnames from first row keys
+        fieldnames = list(csv_rows[0].keys()) if csv_rows else []
+        
+        # Check required headers
+        required_headers = ['Website']
+        missing_headers = [h for h in required_headers if h not in fieldnames]
+        
+        if missing_headers:
+            raise ValueError(
+                f"CSV rows are missing required headers: {', '.join(missing_headers)}. "
+                f"Found columns: {', '.join(fieldnames)}"
+            )
+        
+        for row in csv_rows:
+            website = row.get('Website', '').strip()
+            short_description = row.get('Short Description', '').strip()
+            exa = row.get('Exa', '').strip() if 'Exa' in row else ''
+            
+            rows.append({
+                'website': website,
+                'short_description': short_description if short_description else None,
+                'exa': exa
+            })
+        
+        return rows
+    
     def read_csv_rows(self, csv_path: str) -> List[Dict[str, str]]:
         """
         Read rows from CSV file with new format.
@@ -342,8 +410,6 @@ class CSVUploader:
         Returns:
             List of dictionaries with 'website', 'short_description', 'exa' keys
         """
-        rows = []
-        
         try:
             with open(csv_path, 'r', encoding='utf-8') as csvfile:
                 reader = csv.DictReader(csvfile)
@@ -352,27 +418,11 @@ class CSVUploader:
                 if reader.fieldnames is None:
                     raise ValueError("CSV file appears to be empty or invalid.")
                 
-                required_headers = ['Website']
-                missing_headers = [h for h in required_headers if h not in reader.fieldnames]
+                # Convert reader to list of dicts
+                csv_rows = list(reader)
                 
-                if missing_headers:
-                    raise ValueError(
-                        f"CSV file is missing required headers: {', '.join(missing_headers)}. "
-                        f"Found columns: {', '.join(reader.fieldnames)}"
-                    )
-                
-                for row_num, row in enumerate(reader, start=2):  # Start at 2 (header is row 1)
-                    website = row.get('Website', '').strip()
-                    short_description = row.get('Short Description', '').strip()
-                    exa = row.get('Exa', '').strip() if 'Exa' in row else ''
-                    
-                    rows.append({
-                        'website': website,
-                        'short_description': short_description if short_description else None,
-                        'exa': exa
-                    })
-            
-            return rows
+                # Use the row-based parsing method
+                return self.parse_csv_rows(csv_rows)
         except FileNotFoundError:
             raise FileNotFoundError(f"CSV file not found: {csv_path}")
         except Exception as e:
@@ -586,6 +636,139 @@ class CSVUploader:
         print(f"  exa_values_used_for_new_rows: {exa_values_used_for_new_rows}")
         print(f"Uploaded project={self.project_id} run_token={current_run_token} rows={inserted_count}")
         print("Upload workflow completed!")
+
+
+def run(project_id: str, csv_rows: List[Dict[str, str]]) -> Dict[str, Any]:
+    """
+    Run the upload workflow with provided CSV rows.
+    
+    Args:
+        project_id: Project ID to scope all operations
+        csv_rows: List of CSV row dictionaries (from DictReader)
+        
+    Returns:
+        Dictionary with upload results including status, project_id, and row counts
+    """
+    # Generate run token at the start
+    current_run_token = str(uuid.uuid4())
+    
+    print("Starting CSV upload workflow...")
+    print(f"Using project_id={project_id}")
+    print(f"Using run_token={current_run_token}")
+    print("-" * 50)
+    
+    try:
+        uploader = CSVUploader(project_id)
+        
+        # Test connection
+        print("Testing Supabase connection...")
+        if not uploader.test_connection():
+            raise Exception("Cannot proceed without a valid Supabase connection.")
+        
+        print("-" * 50)
+        
+        # Extract and upload prompts FIRST (before prospect upload)
+        print("Extracting prompts from CSV rows...")
+        try:
+            prompts_deduplicated, prompts_found_raw = uploader.extract_prompts_from_rows(csv_rows)
+            prompts_inserted = len(prompts_deduplicated)
+            
+            print(f"prompts_found_raw: {prompts_found_raw}")
+            print(f"prompts_inserted: {prompts_inserted}")
+            
+            # If zero prompts found, log error and raise
+            if prompts_inserted == 0:
+                raise Exception("Zero prompts found in CSV. Aborting to prevent accidental deletion of prompts table.")
+            
+            # Upload prompts
+            print("Uploading prompts to public.prompts...")
+            uploader.upload_prompts(prompts_deduplicated)
+            print(f"Deleted existing prompts and inserted {prompts_inserted} new prompts (with run_if).")
+            
+        except Exception as e:
+            raise Exception(f"Failed to upload prompts: {str(e)}")
+        
+        print("-" * 50)
+        
+        # Parse rows from CSV for prospects
+        print("Parsing CSV rows for prospects...")
+        try:
+            rows = uploader.parse_csv_rows(csv_rows)
+            rows_read = len(rows)
+            print(f"Found {rows_read} rows in CSV")
+        except Exception as e:
+            raise Exception(f"Error parsing CSV rows: {str(e)}")
+        
+        if not rows:
+            print("No rows found in CSV rows.")
+            return {
+                "status": "ok",
+                "project_id": project_id,
+                "rows": 0,
+                "inserted": 0,
+                "skipped_blank": 0,
+                "skipped_duplicate": 0,
+                "failed": 0,
+                "exa_overwrites_applied": 0,
+                "exa_values_used_for_new_rows": 0
+            }
+        
+        print("-" * 50)
+        
+        # Delete all existing prospects for this project_id (wipe-and-replace behavior)
+        print(f"Deleting existing prospects for project_id={project_id}...")
+        try:
+            delete_response = (
+                uploader.supabase.table('prospects')
+                .delete()
+                .eq('project_id', project_id)
+                .execute()
+            )
+            print(f"Deleted existing prospects for project_id={project_id}")
+        except Exception as e:
+            print(f"Error deleting existing prospects: {str(e)}")
+            # Continue anyway - may be schema not ready yet
+        
+        print("-" * 50)
+        
+        # Fetch existing websites (should be empty after delete, but check for safety)
+        print("Checking for existing websites in database...")
+        existing_websites = uploader.get_existing_websites()
+        print(f"Found {len(existing_websites)} existing websites in database")
+        
+        print("-" * 50)
+        
+        # Upload new rows
+        print("Uploading new rows...")
+        inserted_count, skipped_blank_count, skipped_duplicate_count, failed_count, exa_overwrites_applied, exa_values_used_for_new_rows = uploader.upload_rows(rows, existing_websites, current_run_token)
+        
+        print("-" * 50)
+        print("Upload Summary:")
+        print(f"  Rows read: {rows_read}")
+        print(f"  Rows skipped (blank website): {skipped_blank_count}")
+        print(f"  Rows skipped (duplicates): {skipped_duplicate_count}")
+        print(f"  Rows inserted: {inserted_count}")
+        print(f"  Rows failed: {failed_count}")
+        print(f"  exa_overwrites_applied: {exa_overwrites_applied}")
+        print(f"  exa_values_used_for_new_rows: {exa_values_used_for_new_rows}")
+        print(f"Uploaded project={project_id} run_token={current_run_token} rows={inserted_count}")
+        print("Upload workflow completed!")
+        
+        return {
+            "status": "ok",
+            "project_id": project_id,
+            "rows": rows_read,
+            "inserted": inserted_count,
+            "skipped_blank": skipped_blank_count,
+            "skipped_duplicate": skipped_duplicate_count,
+            "failed": failed_count,
+            "exa_overwrites_applied": exa_overwrites_applied,
+            "exa_values_used_for_new_rows": exa_values_used_for_new_rows
+        }
+        
+    except Exception as e:
+        print(f"Fatal error: {str(e)}")
+        raise
 
 
 def main():

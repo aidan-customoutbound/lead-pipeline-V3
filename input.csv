@@ -1,110 +1,38 @@
-website
-360works.com
-387labs.ai
-abtech-sol.com
-able-soft.com
-accuware-inc.com
-accylerate.com
-acktify.com
-activateglobally.com
-addition.ml
-website
-stripe.com
-airtable.com
-notion.so
-figma.com
-zapier.com
-loom.com
-webflow.com
-framer.com
-linear.app
-substack.com
-vercel.com
-netlify.com
-digitalocean.com
-heroku.com
-twilio.com
-sendgrid.com
-mailchimp.com
-hubspot.com
-salesforce.com
-zendesk.com
-intercom.com
-drift.com
-gong.io
-outreach.io
-salesloft.com
-apollo.io
-zoominfo.com
-linkedin.com
-crunchbase.com
-pitchbook.com
-cbinsights.com
-carta.com
-pulley.com
-mercury.com
-brex.com
-ramp.com
-bill.com
-expensify.com
-gusto.com
-rippling.com
-deel.com
-remote.com
-oysterhr.com
-lattice.com
-cultureamp.com
-15five.com
-greenhouse.io
-lever.co
-ashbyhq.com
-docusign.com
-hellosign.com
-pandadoc.com
-proposify.com
-canva.com
-adobe.com
-miro.com
-mural.co
-lucidchart.com
-whimsical.com
-monday.com
-asana.com
-trello.com
-clickup.com
-wrike.com
-smartsheet.com
-basecamp.com
-slack.com
-discord.com
-zoom.us
-teams.microsoft.com
-meet.google.com
-dropbox.com
-box.com
-googledrive.com
-onedrive.com
-snowflake.com
-databricks.com
-mongodb.com
-redis.com
-elastic.co
-confluent.io
-hashicorp.com
-gitlab.com
-github.com
-bitbucket.org
-jira.com
-atlassian.com
-datadoghq.com
-newrelic.com
-sentry.io
-pagerduty.com
-splunk.com
-dynatrace.com
-auth0.com
-okta.com
-1password.com
-lastpass.com
-dashlane.com
-nordvpn.com
+Website,Short Description,Exa,Prompts,Run If,Branch
+10fold.com,"10Fold Communications is a public relations and integrated marketing agency based in San Francisco, California. Founded in 1995, the agency specializes in B2B technology, serving over 450 clients across various sectors, including AI, cybersecurity, cloud, fintech, and healthtech. With nearly three decades of experience, 10Fold is recognized as one of California's largest independently run communications agencies.
+
+The firm offers a wide range of services tailored to complex tech industries. These include media relations, content services, crisis communications, and integrated marketing strategies. Their proprietary programs, such as ""Metrics Matter,"" help clients track PR impact and achieve measurable outcomes. 10Fold emphasizes a collaborative culture and deep domain expertise, focusing on supporting innovative B2B brands in articulating their value propositions to key stakeholders.","10Fold Communications is a public relations and integrated marketing agency based in San Francisco, California. Founded in 1995, the agency specializes in B2B technology, serving over 450 clients across various sectors, including AI, cybersecurity, cloud, fintech, and healthtech. With nearly three decades of experience, 10Fold is recognized as one of California's largest independently run communications agencies.
+
+The firm offers a wide range of services tailored to complex tech industries. These include media relations, content services, crisis communications, and integrated marketing strategies. Their proprietary programs, such as ""Metrics Matter,"" help clients track PR impact and achieve measurable outcomes. 10Fold emphasizes a collaborative culture and deep domain expertise, focusing on supporting innovative B2B brands in articulating their value propositions to key stakeholders.","Is this company B2B or B2C? You should only return one of those as your answer with no additional text. If the company is both B2B and B2C, just return B2B. If you do not have enough information to return an accurate answer, return only an empty string. Here ic the company description: {company_summary}",,
+2wtech.com,"2W Technologies, Inc. is a technology solutions provider based in Pewaukee, Wisconsin, with over 30 years of experience. Founded in 1985, the company specializes in Epicor ERP, IT infrastructure, cloud services, and managed services for clients across North America. They serve a diverse range of organizations, from small family businesses to large multinational corporations, focusing primarily on the manufacturing and distribution sectors.
+
+As a prominent Epicor partner and a Microsoft Tier 1 Cloud Solutions Provider, 2W Technologies emphasizes reliable, simplified technology solutions. Their offerings include Epicor ERP implementation and support, Microsoft Azure cloud services, 24/7 IT infrastructure management, cybersecurity, and advanced technologies like artificial intelligence and data analytics. The company is committed to helping clients improve their operations through expert consulting and tailored solutions. With a dedicated team of around 59 employees, they maintain a strong presence across multiple states and have been recognized as a top managed services provider.","2W Technologies, Inc. is a technology solutions provider based in Pewaukee, Wisconsin, with over 30 years of experience. Founded in 1985, the company specializes in Epicor ERP, IT infrastructure, cloud services, and managed services for clients across North America. They serve a diverse range of organizations, from small family businesses to large multinational corporations, focusing primarily on the manufacturing and distribution sectors.
+
+As a prominent Epicor partner and a Microsoft Tier 1 Cloud Solutions Provider, 2W Technologies emphasizes reliable, simplified technology solutions. Their offerings include Epicor ERP implementation and support, Microsoft Azure cloud services, 24/7 IT infrastructure management, cybersecurity, and advanced technologies like artificial intelligence and data analytics. The company is committed to helping clients improve their operations through expert consulting and tailored solutions. With a dedicated team of around 59 employees, they maintain a strong presence across multiple states and have been recognized as a top managed services provider.","Given a company description, I want you to put the company into the following categories based on how they primarily generate revenue: 1) Sells a software product, 2) Sells a physical or hardware product, 3) Provides services, 4) Performs medical research. Here are the rules: 1) Your answer should be exactly one of the options with no additional text, 2) You should take your time to determine your answer. If you do not have enough information to return a highly accurate answer, then you must return an empty string with no other words. Here is the company description: {company_summary}","{step1_output} contains: ""B2B""",
+gong.io,,,,"{step1_output} contains: ""B2B""","BRANCH({step2_output}):
+""services"" :: Generate a concise bullet list of this company's services. Base your answer only on: {company_summary}
+""products"" :: Generate a concise bullet list of this company's physical products. Base your answer only on: {company_summary}
+ELSE :: """""
+360smartnetworks.com,"360 Smart Networks is a managed service provider located in Roswell, GA that provides IT solutions to small and medium businesses in metro Atlanta and and Charlotte, and throughout the southeast United States. We can support an in-house IT team, or handle a company's IT architecture entirely. We offer a comprehensive integrated suite of products, services, and protocols called TekSurance. TekSurance provides businesses with security, backup, disaster recovery, and maintenance and support so they can effectively conduct their operations and move their business forward. Contact us at sales@360smartnet.com or 770-518-7087 for more information on our IT solutions.
+
+We establish long-term relationships with our clients and provide them with the necessary IT infrastructure and services to help them grow their businesses.  We are dedicated to maintaining open communication and providing quality customer service.",,,,
+3gimbals.com,"3GIMBALS is an analytic services firm based in Miami, Florida, founded in 2015. The company specializes in transforming technology and data into actionable intelligence for federal government, military, national security, and law enforcement missions. With a team of academics, researchers, veterans, and technologists, 3GIMBALS focuses on collaboration to tackle complex challenges and support the United States and its allies.
+
+The firm offers tailored solutions, including the OMEN information fusion and analysis platform and the Ti technology identification and integration service. Their expertise spans GIS and spatial analytics, earth observation, and emerging technologies, among others. 3GIMBALS holds a GSA contract, indicating strong partnerships with federal agencies. The company emphasizes a supportive culture with comprehensive employee benefits, including health coverage, tuition reimbursement, and flexible PTO.","3GIMBALS is an analytic services firm based in Miami, Florida, founded in 2015. The company specializes in transforming technology and data into actionable intelligence for federal government, military, national security, and law enforcement missions. With a team of academics, researchers, veterans, and technologists, 3GIMBALS focuses on collaboration to tackle complex challenges and support the United States and its allies.
+
+The firm offers tailored solutions, including the OMEN information fusion and analysis platform and the Ti technology identification and integration service. Their expertise spans GIS and spatial analytics, earth observation, and emerging technologies, among others. 3GIMBALS holds a GSA contract, indicating strong partnerships with federal agencies. The company emphasizes a supportive culture with comprehensive employee benefits, including health coverage, tuition reimbursement, and flexible PTO.",,,
+exa.ai,,,,,
+8thlight.com,"8th Light is an employee-owned tech solutions provider founded in 2006 and headquartered in Chicago, Illinois. The company specializes in software craftsmanship, digital product development, and technology consulting for various regulated industries. With over 140 team members across locations including London, Los Angeles, New York, and Austin, 8th Light emphasizes collaboration, continuous learning, and human-centered design.
+
+The company offers a range of tech solutions, including product strategy and innovation, software development, design services, and engineering operations. Their approach combines disciplined engineering with human-centered design to create tailored digital products. 8th Light has built a reputation for its commitment to education and ownership, recruiting diverse talent through an apprenticeship program. They have partnered with organizations across multiple sectors, delivering impactful projects in areas such as healthcare, finance, and e-commerce.","8th Light is an employee-owned tech solutions provider founded in 2006 and headquartered in Chicago, Illinois. The company specializes in software craftsmanship, digital product development, and technology consulting for various regulated industries. With over 140 team members across locations including London, Los Angeles, New York, and Austin, 8th Light emphasizes collaboration, continuous learning, and human-centered design.
+
+The company offers a range of tech solutions, including product strategy and innovation, software development, design services, and engineering operations. Their approach combines disciplined engineering with human-centered design to create tailored digital products. 8th Light has built a reputation for its commitment to education and ownership, recruiting diverse talent through an apprenticeship program. They have partnered with organizations across multiple sectors, delivering impactful projects in areas such as healthcare, finance, and e-commerce.",,,
+aaravsolutions.com,"Aarav Solutions is a global product engineering and IT consulting services provider founded in 2012. Headquartered in Iselin, New Jersey, with additional offices in Bengaluru, India, the company specializes in delivering customized technology solutions to enterprises, startups, and small to medium businesses across various industries, including telecommunications, banking, government, and hospitality. Aarav Solutions employs between 50 to 249 people and generates approximately $21.4 million in revenue.
+
+The company offers a wide range of IT services, including web development, enterprise implementation, IT consulting, and outsourcing. Notable products include OmniTel360, a CRM-BRM suite designed for telecommunications companies. Aarav Solutions emphasizes high quality, security standards, and timely delivery, having served over 100 clients. The leadership team includes Bhavin Patel as COO and Raj Darji as CEO. Additionally, the company is involved in social initiatives through the Jadishwar Charitable Trust, focusing on education, medical aid, and disaster relief.",,,,
+abogadosnow.com,"Abogados Now is a Hispanic marketing agency founded in 2017, focusing on bilingual digital marketing solutions for attorneys targeting the U.S. Hispanic community. Headquartered in Long Beach, California, the agency has grown to support over 400 law firms, from solo practitioners to major legal brands, by providing culturally relevant and data-driven strategies.
+
+The agency offers a range of services tailored for plaintiff attorneys, including digital advertising, website development, social media management, and virtual assistant support. Their campaigns are designed to generate leads through authentic Spanish marketing, ensuring that calls and inquiries go directly to the law firms. Abogados Now emphasizes empowering attorneys to manage their own lead generation, enhancing their branding and return on investment in underrepresented digital spaces.","Abogados Now is a Hispanic marketing agency founded in 2017, focusing on bilingual digital marketing solutions for attorneys targeting the U.S. Hispanic community. Headquartered in Long Beach, California, the agency has grown to support over 400 law firms, from solo practitioners to major legal brands, by providing culturally relevant and data-driven strategies.
+
+The agency offers a range of services tailored for plaintiff attorneys, including digital advertising, website development, social media management, and virtual assistant support. Their campaigns are designed to generate leads through authentic Spanish marketing, ensuring that calls and inquiries go directly to the law firms. Abogados Now emphasizes empowering attorneys to manage their own lead generation, enhancing their branding and return on investment in underrepresented digital spaces.",,,
+leanderisd.org,,,,,

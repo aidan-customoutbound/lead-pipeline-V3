@@ -1977,6 +1977,29 @@ class EnrichmentWorkflow:
         print("=" * 60)
 
 
+async def run(project_id: str) -> None:
+    """
+    Run the enrichment workflow for a given project_id.
+    
+    Args:
+        project_id: Project ID to scope all operations
+    """
+    try:
+        # Initialize workflow (creates global clients)
+        workflow = EnrichmentWorkflow(project_id)
+        # Run batch processing
+        await workflow.run()
+    except ValueError as e:
+        print(f"Configuration error: {str(e)}")
+        raise
+    except KeyboardInterrupt:
+        print("\n\nWorkflow interrupted by user. Progress has been saved.")
+        raise
+    except Exception as e:
+        print(f"Fatal error: {str(e)}")
+        raise
+
+
 async def main():
     """Entry point for the script."""
     # Get project_id from command line or environment variable
@@ -1994,10 +2017,7 @@ async def main():
         sys.exit(1)
     
     try:
-        # Initialize workflow (creates global clients)
-        workflow = EnrichmentWorkflow(project_id)
-        # Run batch processing
-        await workflow.run()
+        await run(project_id)
     except ValueError as e:
         print(f"Configuration error: {str(e)}")
     except KeyboardInterrupt:
