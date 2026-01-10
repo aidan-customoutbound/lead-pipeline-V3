@@ -7,6 +7,7 @@ skipping duplicates. It also uploads prompts from the Prompts column to the publ
 
 import csv
 import os
+import re
 import sys
 import uuid
 from typing import Any, Dict, List, Optional, Set
@@ -205,12 +206,13 @@ class CSVUploader:
         except Exception as e:
             raise Exception(f"Error reading prompts from CSV file: {str(e)}")
     
-    def upload_prompts(self, prompts: List[Dict[str, str]]) -> None:
+    def upload_prompts(self, prompts: List[Dict[str, str]], sheet_id: Optional[str] = None) -> None:
         """
         Replace all prompts in public.prompts table with the new prompt list.
         
         Args:
             prompts: List of prompt dictionaries with 'prompt_text', 'run_if', and 'branch' keys
+            sheet_id: Optional Google Sheet ID to store with prompts
             
         Raises:
             Exception: If upload fails
@@ -242,6 +244,9 @@ class CSVUploader:
                 # Include branch if present
                 if 'branch' in prompt_data and prompt_data.get('branch'):
                     insert_row['branch'] = prompt_data['branch']
+                # Include sheet_id if provided
+                if sheet_id:
+                    insert_row['sheet_id'] = sheet_id
                 insert_data.append(insert_row)
             
             # Insert new prompts
@@ -571,7 +576,7 @@ class CSVUploader:
                 print("ERROR: Zero prompts found in CSV. Aborting to prevent accidental deletion of prompts table.")
                 sys.exit(1)
             
-            # Upload prompts
+            # Upload prompts (without sheet_id for CLI usage)
             print("Uploading prompts to public.prompts...")
             self.upload_prompts(prompts_deduplicated)
             print(f"Deleted existing prompts and inserted {prompts_inserted} new prompts (with run_if).")
@@ -638,13 +643,38 @@ class CSVUploader:
         print("Upload workflow completed!")
 
 
-def run(project_id: str, csv_rows: List[Dict[str, str]]) -> Dict[str, Any]:
+def extract_sheet_id_from_url(sheet_url: str) -> Optional[str]:
+    """
+    Extract Google Sheet ID from a Google Sheets URL.
+    
+    Google Sheet URLs have the pattern: /d/<sheet_id>/
+    This function extracts the substring between "/d/" and the next "/".
+    
+    Args:
+        sheet_url: Google Sheets URL
+        
+    Returns:
+        Sheet ID string if found, None otherwise
+    """
+    if not sheet_url:
+        return None
+    
+    # Look for the pattern /d/<sheet_id>/
+    match = re.search(r'/d/([^/]+)', sheet_url)
+    if match:
+        return match.group(1)
+    
+    return None
+
+
+def run(project_id: str, csv_rows: List[Dict[str, str]], sheet_url: Optional[str] = None) -> Dict[str, Any]:
     """
     Run the upload workflow with provided CSV rows.
     
     Args:
         project_id: Project ID to scope all operations
         csv_rows: List of CSV row dictionaries (from DictReader)
+        sheet_url: Optional Google Sheets URL to extract sheet_id from
         
     Returns:
         Dictionary with upload results including status, project_id, and row counts
@@ -656,6 +686,15 @@ def run(project_id: str, csv_rows: List[Dict[str, str]]) -> Dict[str, Any]:
     print(f"Using project_id={project_id}")
     print(f"Using run_token={current_run_token}")
     print("-" * 50)
+    
+    # Extract sheet_id from sheet_url if provided
+    sheet_id = None
+    if sheet_url:
+        sheet_id = extract_sheet_id_from_url(sheet_url)
+        if sheet_id:
+            print(f"Extracted sheet_id={sheet_id} from sheet_url")
+        else:
+            print(f"Warning: Could not extract sheet_id from sheet_url: {sheet_url}")
     
     try:
         uploader = CSVUploader(project_id)
@@ -680,10 +719,10 @@ def run(project_id: str, csv_rows: List[Dict[str, str]]) -> Dict[str, Any]:
             if prompts_inserted == 0:
                 raise Exception("Zero prompts found in CSV. Aborting to prevent accidental deletion of prompts table.")
             
-            # Upload prompts
+            # Upload prompts with sheet_id
             print("Uploading prompts to public.prompts...")
-            uploader.upload_prompts(prompts_deduplicated)
-            print(f"Deleted existing prompts and inserted {prompts_inserted} new prompts (with run_if).")
+            uploader.upload_prompts(prompts_deduplicated, sheet_id=sheet_id)
+            print(f"Deleted existing prompts and inserted {prompts_inserted} new prompts (with run_if and sheet_id).")
             
         except Exception as e:
             raise Exception(f"Failed to upload prompts: {str(e)}")

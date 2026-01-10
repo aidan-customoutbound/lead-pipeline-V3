@@ -164,8 +164,8 @@ async def upload_endpoint(request: Request) -> JSONResponse:
         # Fetch CSV from URL
         csv_rows = fetch_csv_from_url(sheet_url)
         
-        # Call upload_csv.run()
-        result = upload_csv.run(project_id, csv_rows)
+        # Call upload_csv.run() with sheet_url to extract and store sheet_id
+        result = upload_csv.run(project_id, csv_rows, sheet_url=sheet_url)
         
         logger.info(f"[{timestamp}] POST /upload - SUCCESS - project_id={project_id} rows={result.get('rows', 0)}")
         

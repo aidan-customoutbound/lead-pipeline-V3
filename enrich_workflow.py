@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from exa_py import Exa
 from openai import AsyncOpenAI
+import sheet_export
 
 # Load environment variables
 load_dotenv()
@@ -1920,6 +1921,40 @@ class EnrichmentWorkflow:
             
             total_processed += len(filtered_batch)
             print(f"[Batch {batch_number}] Batch Complete: {len(filtered_batch)} rows processed (Total: {total_processed})")
+        
+        # Export results to Google Sheets if run completed successfully (not superseded)
+        if not self.run_superseded:
+            # Check if sheet_id exists before attempting export
+            print("\n[EXPORT] Checking for sheet_id...")
+            try:
+                # Fetch sheet_id from prompts table
+                sheet_id_response = (
+                    self.supabase.table('prompts')
+                    .select('sheet_id')
+                    .eq('project_id', self.project_id)
+                    .eq('is_active', True)
+                    .limit(1)
+                    .execute()
+                )
+                
+                sheet_id = None
+                if sheet_id_response.data and len(sheet_id_response.data) > 0:
+                    sheet_id = sheet_id_response.data[0].get('sheet_id')
+                
+                if not sheet_id or not sheet_id.strip():
+                    print(f"  [EXPORT] No sheet_id for project {self.project_id}, skipping export")
+                else:
+                    print("\n[EXPORT] Exporting results to Google Sheets...")
+                    try:
+                        sheet_export.export_results_to_google_sheets(self.project_id)
+                    except Exception as e:
+                        # Log error but don't crash - export failures are non-fatal
+                        print(f"  [EXPORT] Error during export (non-fatal): {str(e)}")
+            except Exception as e:
+                # Log error but don't crash - export failures are non-fatal
+                print(f"  [EXPORT] Error checking sheet_id (non-fatal): {str(e)}")
+        else:
+            print("\n[EXPORT] Run was superseded, skipping Google Sheets export")
         
         # Capture end time at the very end
         end_time = time.time()
