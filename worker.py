@@ -166,5 +166,20 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    print("[worker] Starting worker...")
+    while True:
+        try:
+            run_row = claim_next_run()
+            if not run_row:
+                print("[worker] No queued runs... sleeping 5s")
+                time.sleep(5)
+                continue
+
+            print(f"[worker] Processing run_id={run_row['id']}")
+            process_run(run_row)
+
+        except Exception as e:
+            print(f"[worker] Fatal error in worker loop: {e}")
+            time.sleep(5)
+
 
