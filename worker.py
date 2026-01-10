@@ -8,10 +8,12 @@ claims them atomically, and executes the enrichment workflow.
 import asyncio
 import os
 import sys
+import time
 from datetime import datetime
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from api_server import get_supabase_client
 
 import enrich_workflow
 
@@ -91,7 +93,7 @@ def claim_next_run(supabase: Client) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def process_run(supabase: Client, run: Dict[str, Any]) -> None:
+async def process_run(run_row, supabase):
     """
     Process a claimed run by executing the enrichment workflow.
     
@@ -99,8 +101,8 @@ async def process_run(supabase: Client, run: Dict[str, Any]) -> None:
         supabase: Supabase client instance
         run: Dictionary with run data (id, project_id)
     """
-    run_id = run["id"]
-    project_id = run["project_id"]
+    run_id = run_row["id"]
+    project_id = run_row["project_id"]
     
     log(f"processing run {run_id} for project {project_id}")
     
@@ -167,16 +169,17 @@ async def main():
 
 if __name__ == "__main__":
     print("[worker] Starting worker...")
+    supabase = get_supabase_client()
     while True:
         try:
-            run_row = claim_next_run()
+            run_row = claim_next_run(supabase)
             if not run_row:
                 print("[worker] No queued runs... sleeping 5s")
                 time.sleep(5)
                 continue
 
             print(f"[worker] Processing run_id={run_row['id']}")
-            process_run(run_row)
+            process_run(run_row, supabase)
 
         except Exception as e:
             print(f"[worker] Fatal error in worker loop: {e}")
