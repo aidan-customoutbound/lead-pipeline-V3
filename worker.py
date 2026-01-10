@@ -108,7 +108,7 @@ def process_run(run_row, supabase):
     
     try:
         # Run the enrichment workflow
-        enrich_workflow.run(project_id)
+        asyncio.run(enrich_workflow.run(project_id))
         
         # Update run to completed
         finished_at = datetime.utcnow()
