@@ -93,7 +93,7 @@ def claim_next_run(supabase: Client) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def process_run(run_row, supabase):
+def process_run(run_row, supabase):
     """
     Process a claimed run by executing the enrichment workflow.
     
@@ -108,7 +108,7 @@ async def process_run(run_row, supabase):
     
     try:
         # Run the enrichment workflow
-        await enrich_workflow.run(project_id)
+        enrich_workflow.run(project_id)
         
         # Update run to completed
         finished_at = datetime.utcnow()
