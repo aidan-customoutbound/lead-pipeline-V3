@@ -17,6 +17,7 @@ import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
 # Import the run functions from our modules
 import upload_csv
@@ -37,6 +38,29 @@ app = FastAPI(title="Lead Pipeline API Server")
 
 # Get secret from environment
 GOOGLE_PUSH_SECRET = os.getenv("GOOGLE_PUSH_SECRET")
+
+# Supabase configuration for runs table
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+
+def get_supabase_client() -> Client:
+    """
+    Create and return a Supabase client for the runs table.
+    
+    Returns:
+        Supabase client instance
+        
+    Raises:
+        HTTPException: If Supabase configuration is missing
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.error("SUPABASE_URL or SUPABASE_KEY environment variables are not set")
+        raise HTTPException(
+            status_code=500,
+            detail="Server configuration error: Supabase credentials not configured"
+        )
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def validate_secret(secret: str) -> None:
@@ -194,8 +218,9 @@ async def start_endpoint(request: Request) -> JSONResponse:
     }
     
     Returns:
-        JSON response with status and project_id
+        JSON response with status, project_id, and run_id
     """
+    run_id = None
     try:
         # Parse request body
         body = await request.json()
@@ -216,15 +241,81 @@ async def start_endpoint(request: Request) -> JSONResponse:
         # Validate secret
         validate_secret(secret)
         
-        # Call enrich_workflow.run() inline (not background)
-        await enrich_workflow.run(project_id)
+        # Create Supabase client for runs table
+        supabase = get_supabase_client()
         
-        logger.info(f"[{timestamp}] POST /start - SUCCESS - project_id={project_id}")
+        # Insert a new run row with status='running'
+        started_at = datetime.utcnow()
+        try:
+            run_insert_response = supabase.table("runs").insert({
+                "project_id": project_id,
+                "status": "running",
+                "started_at": started_at.isoformat()
+            }).execute()
+            
+            if not run_insert_response.data or len(run_insert_response.data) == 0:
+                logger.error("Failed to insert run row: no data returned")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to create run record"
+                )
+            
+            run_id = run_insert_response.data[0]["id"]
+            logger.info(f"Created run record: run_id={run_id}, project_id={project_id}")
+            
+        except Exception as e:
+            logger.error(f"Error inserting run row: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to create run record: {str(e)}"
+            )
         
-        return JSONResponse(content={
-            "status": "started",
-            "project_id": project_id
-        })
+        # Run enrichment workflow with error handling
+        try:
+            await enrich_workflow.run(project_id)
+            
+            # Update run row to 'completed'
+            finished_at = datetime.utcnow()
+            try:
+                supabase.table("runs").update({
+                    "status": "completed",
+                    "finished_at": finished_at.isoformat()
+                }).eq("id", run_id).execute()
+                logger.info(f"Updated run record to completed: run_id={run_id}")
+            except Exception as e:
+                # Log but don't fail the request if update fails
+                logger.error(f"Error updating run row to completed: {str(e)}", exc_info=True)
+            
+            logger.info(f"[{timestamp}] POST /start - SUCCESS - project_id={project_id}, run_id={run_id}")
+            
+            return JSONResponse(content={
+                "status": "completed",
+                "project_id": project_id,
+                "run_id": run_id
+            })
+            
+        except Exception as e:
+            # Update run row to 'failed'
+            finished_at = datetime.utcnow()
+            error_message = str(e)[:500]  # Truncate to first 500 chars
+            
+            try:
+                supabase.table("runs").update({
+                    "status": "failed",
+                    "finished_at": finished_at.isoformat(),
+                    "error_message": error_message
+                }).eq("id", run_id).execute()
+                logger.info(f"Updated run record to failed: run_id={run_id}, error={error_message[:100]}")
+            except Exception as update_error:
+                # Log but don't fail the request if update fails
+                logger.error(f"Error updating run row to failed: {str(update_error)}", exc_info=True)
+            
+            # Re-raise as HTTPException so client sees an error
+            logger.error(f"Error in enrichment workflow: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Enrichment workflow failed: {str(e)}"
+            )
         
     except HTTPException:
         # Re-raise HTTP exceptions
