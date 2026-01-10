@@ -8,3 +8,31 @@ __pycache__/
 # Ignore virtual environments
 .venv
 venv/
+
+
+# Environment & secrets
+.env
+*.env
+*.env.*
+.envrc
+.key
+*.key
+*.json
+secrets/
+config/local.yaml
+
+# VS Code / editor temp
+.vscode/
+*.code-workspace
+
+# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual Environments
+.venv/
+venv/
+
+# Local only utility folders
+logs/
