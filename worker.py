@@ -16,6 +16,9 @@ from supabase import create_client, Client
 from api_server import get_supabase_client
 
 import enrich_workflow
+# Note: recipe_workflow exists for Master-sheet-driven recipe execution.
+# It will be wired to the /start endpoint and worker logic in a future step.
+import recipe_workflow  # noqa: F401  # Imported for future use, not yet called
 
 # Load environment variables
 load_dotenv()
