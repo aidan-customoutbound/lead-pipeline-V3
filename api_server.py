@@ -218,7 +218,8 @@ async def start_endpoint(request: Request) -> JSONResponse:
     Request body (JSON):
     {
         "project_id": "...",
-        "secret": "..."
+        "secret": "...",
+        "run_type": "..." (optional, defaults to "enrichment")
     }
     
     Returns:
@@ -229,10 +230,17 @@ async def start_endpoint(request: Request) -> JSONResponse:
         body = await request.json()
         project_id = body.get("project_id")
         secret = body.get("secret")
+        run_type = body.get("run_type", "enrichment")
+        
+        # Default to 'enrichment' if run_type is not provided or blank
+        if not run_type or not run_type.strip():
+            run_type = "enrichment"
+        else:
+            run_type = run_type.strip()
         
         # Log request
         timestamp = datetime.utcnow().isoformat()
-        logger.info(f"[{timestamp}] POST /start - project_id={project_id}")
+        logger.info(f"[{timestamp}] POST /start - project_id={project_id}, run_type={run_type}")
         
         # Validate required fields
         if not project_id or not project_id.strip():
@@ -269,6 +277,7 @@ async def start_endpoint(request: Request) -> JSONResponse:
             run_insert_response = supabase.table("runs").insert({
                 "project_id": project_id,
                 "status": "queued",
+                "run_type": run_type,
                 "started_at": None,
                 "finished_at": None,
                 "run_token": None,

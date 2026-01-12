@@ -6,7 +6,7 @@ This module handles exporting completed prospect data from Supabase to a Google 
 
 import json
 import os
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from google.oauth2 import service_account
@@ -19,6 +19,245 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
+
+
+def get_sheets_service():
+    """
+    Create and return an authenticated Google Sheets API service client.
+    
+    Returns:
+        Google Sheets API service object, or None if configuration is missing/invalid
+    """
+    if not GOOGLE_SA_JSON:
+        print("  [SHEET EXPORT] GOOGLE_SA_JSON not set, cannot create Sheets service")
+        return None
+    
+    try:
+        sa_credentials = json.loads(GOOGLE_SA_JSON)
+        credentials = service_account.Credentials.from_service_account_info(
+            sa_credentials,
+            scopes=['https://www.googleapis.com/auth/spreadsheets']
+        )
+        service = build('sheets', 'v4', credentials=credentials)
+        return service
+    except Exception as e:
+        print(f"  [SHEET EXPORT] Error creating Sheets service: {str(e)}")
+        return None
+
+
+def get_sheet_id_for_project(project_id: str, supabase_client: Client) -> Optional[str]:
+    """
+    Fetch sheet_id from prompts table for a given project_id.
+    
+    Args:
+        project_id: Project ID to look up
+        supabase_client: Supabase client instance
+        
+    Returns:
+        sheet_id string if found, None otherwise
+    """
+    try:
+        sheet_id_response = (
+            supabase_client.table('prompts')
+            .select('sheet_id')
+            .eq('project_id', project_id)
+            .eq('is_active', True)
+            .limit(1)
+            .execute()
+        )
+        
+        if sheet_id_response.data and len(sheet_id_response.data) > 0:
+            sheet_id = sheet_id_response.data[0].get('sheet_id')
+            if sheet_id and sheet_id.strip():
+                return sheet_id.strip()
+        
+        return None
+    except Exception as e:
+        print(f"  [SHEET EXPORT] Error fetching sheet_id for project_id={project_id}: {str(e)}")
+        return None
+
+
+def read_tab_as_rows(service, sheet_id: str, tab_name: str) -> List[Dict[str, Any]]:
+    """
+    Read all data from a Google Sheets tab and return as list of dictionaries.
+    
+    The first row is treated as headers. Each subsequent row becomes a dict
+    mapping header -> cell value.
+    
+    Args:
+        service: Google Sheets API service object
+        sheet_id: Google Sheets spreadsheet ID
+        tab_name: Name of the tab to read
+        
+    Returns:
+        List of dictionaries, one per data row (empty list if tab is empty or doesn't exist)
+    """
+    try:
+        sheets = service.spreadsheets()
+        range_name = f"{tab_name}!A:ZZ"
+        
+        result = sheets.values().get(
+            spreadsheetId=sheet_id,
+            range=range_name
+        ).execute()
+        
+        values = result.get('values', [])
+        
+        if not values:
+            return []
+        
+        # First row is headers
+        headers = [str(h).strip() if h else "" for h in values[0]]
+        
+        # Build list of dicts from remaining rows
+        rows = []
+        for row_data in values[1:]:
+            row_dict = {}
+            for i, header in enumerate(headers):
+                if i < len(row_data):
+                    row_dict[header] = str(row_data[i]).strip() if row_data[i] else ""
+                else:
+                    row_dict[header] = ""
+            rows.append(row_dict)
+        
+        return rows
+        
+    except Exception as e:
+        print(f"  [SHEET EXPORT] Error reading tab '{tab_name}' from sheet_id={sheet_id}: {str(e)}")
+        return []
+
+
+def write_rows_to_tab(service, sheet_id: str, tab_name: str, rows: List[Dict[str, Any]]) -> None:
+    """
+    Write rows to a Google Sheets tab, clearing existing data first.
+    
+    Args:
+        service: Google Sheets API service object
+        sheet_id: Google Sheets spreadsheet ID
+        tab_name: Name of the tab to write to
+        rows: List of dictionaries to write (keys become headers)
+        
+    Raises:
+        Exception: If Sheets API operation fails
+    """
+    sheets = service.spreadsheets()
+    range_name = f"{tab_name}!A:ZZ"
+    
+    # Clear the tab first
+    sheets.values().clear(
+        spreadsheetId=sheet_id,
+        range=range_name
+    ).execute()
+    
+    # If no rows, we're done (tab is already cleared)
+    if not rows:
+        return
+    
+    # Build 2D array: first row is headers, subsequent rows are values
+    headers = list(rows[0].keys())
+    data_rows = [headers]  # First row is headers
+    
+    for row in rows:
+        row_values = []
+        for header in headers:
+            value = row.get(header)
+            if value is None:
+                row_values.append('')
+            else:
+                row_values.append(str(value))
+        data_rows.append(row_values)
+    
+    # Write data starting at A1
+    sheets.values().update(
+        spreadsheetId=sheet_id,
+        range=f"{tab_name}!A1",
+        valueInputOption='RAW',
+        body={'values': data_rows}
+    ).execute()
+
+
+def update_master_statuses(service, sheet_id: str, tab_name: str, updates: List[Dict[str, Any]]) -> None:
+    """
+    Update Status column values in the Master tab for specified rows.
+    
+    Args:
+        service: Google Sheets API service object
+        sheet_id: Google Sheets spreadsheet ID
+        tab_name: Name of the tab (typically "Master")
+        updates: List of dicts with 'row_index' (1-based) and 'status' keys
+        
+    Raises:
+        Exception: If Sheets API operation fails
+    """
+    if not updates:
+        return
+    
+    sheets = service.spreadsheets()
+    
+    # Read header row to find Status column
+    header_range = f"{tab_name}!1:1"
+    header_result = sheets.values().get(
+        spreadsheetId=sheet_id,
+        range=header_range
+    ).execute()
+    
+    header_values = header_result.get('values', [])
+    if not header_values or not header_values[0]:
+        raise ValueError(f"Could not read header row from {tab_name}")
+    
+    headers = header_values[0]
+    
+    # Convert column index to A1 notation (A=0, B=1, etc.)
+    # For columns beyond Z, we need to handle AA, AB, etc.
+    def col_index_to_letter(col_idx):
+        """Convert 0-based column index to A1 notation letter(s)."""
+        result = ""
+        col_idx += 1  # Convert to 1-based
+        while col_idx > 0:
+            col_idx -= 1
+            result = chr(65 + (col_idx % 26)) + result
+            col_idx //= 26
+        return result
+    
+    # Find Status column index (0-based)
+    status_col_index = None
+    for i, header in enumerate(headers):
+        if str(header).strip().lower() == "status":
+            status_col_index = i
+            break
+    
+    # If Status column doesn't exist, append it
+    if status_col_index is None:
+        # Append "Status" to header row
+        status_col_index = len(headers)
+        status_col_letter = col_index_to_letter(status_col_index)
+        sheets.values().update(
+            spreadsheetId=sheet_id,
+            range=f"{tab_name}!{status_col_letter}1",
+            valueInputOption='RAW',
+            body={'values': [["Status"]]}
+        ).execute()
+    
+    status_col_letter = col_index_to_letter(status_col_index)
+    
+    # Update each row's Status cell
+    for update in updates:
+        row_index = update.get("row_index")
+        status = update.get("status", "")
+        
+        # Skip if row_index is missing or invalid (should be 1-based, >= 2 for data rows)
+        if row_index is None or not isinstance(row_index, int) or row_index < 1:
+            continue
+        
+        # Build A1 notation (e.g., "C5" for column C, row 5)
+        cell_range = f"{tab_name}!{status_col_letter}{row_index}"
+        
+        sheets.values().update(
+            spreadsheetId=sheet_id,
+            range=cell_range,
+            valueInputOption='RAW',
+            body={'values': [[str(status)]]}
+        ).execute()
 
 
 def export_results_to_google_sheets(project_id: str) -> None:
@@ -41,10 +280,6 @@ def export_results_to_google_sheets(project_id: str) -> None:
     """
     try:
         # Validate required environment variables
-        if not GOOGLE_SA_JSON:
-            print("  [SHEET EXPORT] GOOGLE_SA_JSON not set, skipping export")
-            return
-        
         if not SUPABASE_URL or not SUPABASE_KEY:
             print("  [SHEET EXPORT] Supabase credentials not set, skipping export")
             return
@@ -53,20 +288,9 @@ def export_results_to_google_sheets(project_id: str) -> None:
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         
         print(f"  [SHEET EXPORT] Fetching sheet_id for project_id={project_id}...")
-        sheet_id_response = (
-            supabase.table('prompts')
-            .select('sheet_id')
-            .eq('project_id', project_id)
-            .eq('is_active', True)
-            .limit(1)
-            .execute()
-        )
+        sheet_id = get_sheet_id_for_project(project_id, supabase)
         
-        sheet_id = None
-        if sheet_id_response.data and len(sheet_id_response.data) > 0:
-            sheet_id = sheet_id_response.data[0].get('sheet_id')
-        
-        if not sheet_id or not sheet_id.strip():
+        if not sheet_id:
             print(f"  [SHEET EXPORT] No sheet_id found for project_id={project_id}, skipping export")
             return
         
@@ -74,12 +298,11 @@ def export_results_to_google_sheets(project_id: str) -> None:
         print("  [SHEET EXPORT] Starting export to Google Sheets...")
         
         # Step 2: Build Google Sheets API client
-        sa_credentials = json.loads(GOOGLE_SA_JSON)
-        credentials = service_account.Credentials.from_service_account_info(
-            sa_credentials,
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        )
-        service = build('sheets', 'v4', credentials=credentials)
+        service = get_sheets_service()
+        if not service:
+            print("  [SHEET EXPORT] Could not create Sheets service, skipping export")
+            return
+        
         sheets = service.spreadsheets()
         
         # Step 3: Query Supabase for all prospects
