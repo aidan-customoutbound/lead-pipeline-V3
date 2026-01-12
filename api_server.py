@@ -205,6 +205,11 @@ async def upload_endpoint(request: Request) -> JSONResponse:
         )
 
 
+# Contract:
+# - Starting a new run for a project_id will mark any existing runs for that project
+#   with status in ('queued', 'running') as 'superseded'.
+# - The worker treats 'superseded' as a signal to abort the run as soon as possible
+#   to avoid unnecessary Exa/LLM spend.
 @app.post("/start")
 async def start_endpoint(request: Request) -> JSONResponse:
     """
@@ -230,10 +235,10 @@ async def start_endpoint(request: Request) -> JSONResponse:
         logger.info(f"[{timestamp}] POST /start - project_id={project_id}")
         
         # Validate required fields
-        if not project_id:
+        if not project_id or not project_id.strip():
             raise HTTPException(
                 status_code=400,
-                detail="Missing required field: project_id"
+                detail="Missing or empty required field: project_id"
             )
         
         # Validate secret
@@ -242,14 +247,19 @@ async def start_endpoint(request: Request) -> JSONResponse:
         # Create Supabase client for runs table
         supabase = get_supabase_client()
         
-        # Update all existing runs for this project_id that are queued or running
+        # Supersede existing runs for this project_id that are queued or running
         finished_at = datetime.utcnow()
         try:
-            supabase.table("runs").update({
+            supersede_response = supabase.table("runs").update({
                 "status": "superseded",
                 "finished_at": finished_at.isoformat()
             }).eq("project_id", project_id).in_("status", ["queued", "running"]).execute()
-            logger.info(f"Superseded existing queued/running runs for project_id={project_id}")
+            
+            superseded_count = len(supersede_response.data) if supersede_response.data else 0
+            if superseded_count > 0:
+                logger.info(f"Superseded {superseded_count} existing queued/running run(s) for project_id={project_id}")
+            else:
+                logger.info(f"No existing queued/running runs to supersede for project_id={project_id}")
         except Exception as e:
             logger.warning(f"Error superseding existing runs: {str(e)}", exc_info=True)
             # Continue anyway - this is not critical
