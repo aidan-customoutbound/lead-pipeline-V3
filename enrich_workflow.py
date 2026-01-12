@@ -131,11 +131,45 @@ class EnrichmentWorkflow:
         # Run ID for idempotency within this run
         self.run_id = None
         
+        # Database run ID from runs table (for checking if run is still active)
+        self.db_run_id = None
+        
         # Run token for supersession detection (set from first fetched row)
         self.run_token = None
         
         # Flag to track if run was superseded
         self.run_superseded = False
+    
+    def is_run_active(self, run_id: Optional[str] = None) -> bool:
+        """
+        Check if a run is still active (status='running').
+        
+        Args:
+            run_id: Run ID to check. If None, uses self.db_run_id.
+            
+        Returns:
+            True if run status is 'running', False otherwise.
+        """
+        # Use provided run_id or fall back to self.db_run_id
+        check_run_id = run_id or self.db_run_id
+        
+        # If no run_id available, assume active (backward compatibility)
+        if not check_run_id:
+            return True
+        
+        try:
+            resp = (
+                self.supabase.table("runs")
+                .select("status")
+                .eq("id", check_run_id)
+                .single()
+                .execute()
+            )
+            if not resp.data:
+                return False
+            return resp.data.get("status") == "running"
+        except Exception:
+            return False
     
     def _normalize_website(self, website: str) -> str:
         """
@@ -1234,6 +1268,11 @@ class EnrichmentWorkflow:
                 # Copy existing step outputs
                 cached_step_outputs = existing_step_outputs.copy()
                 
+                # Check if run is still active before starting enrichment
+                if not self.is_run_active():
+                    print(f"Run {self.db_run_id} no longer active. Aborting mid-run.")
+                    return
+                
                 # STEP 1: Get Exa summary (conditional on RUN_EXA and exa_summary emptiness)
                 if not RUN_EXA:
                     # RUN_EXA is False: NEVER call Exa API
@@ -1245,8 +1284,19 @@ class EnrichmentWorkflow:
                     self.exa_api_skipped_because_existing_exa_summary += 1
                 else:
                     # RUN_EXA is True AND exa_summary is empty: call Exa API
+                    # Check if run is still active before calling Exa
+                    if not self.is_run_active():
+                        print(f"Run {self.db_run_id} no longer active. Aborting mid-run.")
+                        return
+                    
                     self.exa_api_calls_made += 1
                     cached_exa_summary = await self.get_exa_summary(website)
+                    
+                    # Check if run is still active after Exa call
+                    if not self.is_run_active():
+                        print(f"Run {self.db_run_id} no longer active. Aborting mid-run.")
+                        return
+                    
                     # If Exa fails, accept it and proceed (do not mark as failed)
                     if not cached_exa_summary or not cached_exa_summary.strip():
                         print(f"  [EXA] No summary found for {website} (ID: {prospect_id}, run_id: {self.run_id}) - proceeding without Exa")
@@ -1282,6 +1332,11 @@ class EnrichmentWorkflow:
                 num_prompts = len(self.prompts)
                 
                 for step_num in range(1, num_prompts + 1):
+                    # Check if run is still active before processing next step
+                    if not self.is_run_active():
+                        print(f"Run {self.db_run_id} no longer active. Aborting mid-run.")
+                        return
+                    
                     # Skip if this step already has output
                     if step_num in cached_step_outputs and cached_step_outputs[step_num]:
                         continue
@@ -1430,8 +1485,18 @@ class EnrichmentWorkflow:
                             self.branch_dependency_skips += 1
                         continue  # Continue to next step
                     
+                    # Check if run is still active before calling LLM
+                    if not self.is_run_active():
+                        print(f"Run {self.db_run_id} no longer active. Aborting mid-run.")
+                        return
+                    
                     # All checks passed - run the step with selected prompt
                     step_result = await self._run_enrichment_step(step_num, selected_prompt_template, variables)
+                    
+                    # Check if run is still active after LLM call
+                    if not self.is_run_active():
+                        print(f"Run {self.db_run_id} no longer active. Aborting mid-run.")
+                        return
                     
                     if not step_result:
                         # Step failed after all retries - this is a final failure
@@ -1795,13 +1860,19 @@ class EnrichmentWorkflow:
             print(f"Error fetching prospects batch: {str(e)}")
             return []
     
-    async def run(self) -> None:
+    async def run(self, run_id: str) -> None:
         """
         Main workflow execution with batch processing.
         
         Fetches 50 rows at a time, processes them, then fetches the next batch.
         Continues until no more rows with status='new' are found.
+        
+        Args:
+            run_id: Run ID from the runs table (for checking if run is still active)
         """
+        # Store database run_id for active checks
+        self.db_run_id = run_id
+        
         # Generate run_id for idempotency within this run
         self.run_id = str(uuid.uuid4())[:8]
         
@@ -1876,6 +1947,11 @@ class EnrichmentWorkflow:
         while True:
             batch_number += 1
             
+            # Check if run is still active before processing next batch
+            if not self.is_run_active():
+                print(f"Run {self.db_run_id} no longer active. Aborting mid-run.")
+                return
+            
             # Fetch next batch of 50 rows
             print(f"\n[Batch {batch_number}] Fetching {BATCH_SIZE} prospects with status='new'...")
             batch = self.fetch_batch(BATCH_SIZE)
@@ -1921,6 +1997,12 @@ class EnrichmentWorkflow:
             
             total_processed += len(filtered_batch)
             print(f"[Batch {batch_number}] Batch Complete: {len(filtered_batch)} rows processed (Total: {total_processed})")
+            
+            # Check if run is still active after processing batch
+            if not self.is_run_active():
+                print(f"Run {self.db_run_id} no longer active. Aborting mid-run.")
+                self.run_superseded = True
+                break
         
         # Export results to Google Sheets if run completed successfully (not superseded)
         if not self.run_superseded:
@@ -2012,18 +2094,19 @@ class EnrichmentWorkflow:
         print("=" * 60)
 
 
-async def run(project_id: str) -> None:
+async def run(project_id: str, run_id: str) -> None:
     """
     Run the enrichment workflow for a given project_id.
     
     Args:
         project_id: Project ID to scope all operations
+        run_id: Run ID from the runs table (for checking if run is still active)
     """
     try:
         # Initialize workflow (creates global clients)
         workflow = EnrichmentWorkflow(project_id)
         # Run batch processing
-        await workflow.run()
+        await workflow.run(run_id)
     except ValueError as e:
         print(f"Configuration error: {str(e)}")
         raise
@@ -2052,7 +2135,10 @@ async def main():
         sys.exit(1)
     
     try:
-        await run(project_id)
+        # Generate a temporary run_id for direct script execution
+        # (when not called from worker, there's no runs table entry)
+        temp_run_id = str(uuid.uuid4())
+        await run(project_id, temp_run_id)
     except ValueError as e:
         print(f"Configuration error: {str(e)}")
     except KeyboardInterrupt:

@@ -46,6 +46,26 @@ def get_supabase_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
+def is_run_active(supabase_client, run_id):
+    """
+    Returns True only if the current run's status is 'running'.
+    Returns False for any other status (queued, completed, failed, superseded).
+    """
+    try:
+        resp = (
+            supabase_client.table("runs")
+            .select("status")
+            .eq("id", run_id)
+            .single()
+            .execute()
+        )
+        if not resp.data:
+            return False
+        return resp.data.get("status") == "running"
+    except Exception:
+        return False
+
+
 def claim_next_run(supabase: Client) -> Optional[Dict[str, Any]]:
     """
     Atomically claim the oldest queued run.
@@ -106,21 +126,36 @@ def process_run(run_row, supabase):
     
     log(f"processing run {run_id} for project {project_id}")
     
+    # Check if run is still active before starting
+    if not is_run_active(supabase, run_id):
+        log(f"Run {run_id} is no longer active, stopping processing")
+        return
+    
     try:
-        # Run the enrichment workflow
-        asyncio.run(enrich_workflow.run(project_id))
+        # Run the enrichment workflow (pass run_id for active checks)
+        asyncio.run(enrich_workflow.run(project_id, run_id))
         
-        # Update run to completed
+        # Check if run is still active before marking as completed
+        if not is_run_active(supabase, run_id):
+            log(f"Run {run_id} is no longer active, stopping before marking completed")
+            return
+        
+        # Update run to completed (only if still in 'running' status to prevent superseded runs from updating)
         finished_at = datetime.utcnow()
         supabase.table("runs").update({
             "status": "completed",
             "finished_at": finished_at.isoformat()
-        }).eq("id", run_id).execute()
+        }).eq("id", run_id).eq("status", "running").execute()
         
         log(f"Completed run {run_id} for project {project_id}")
         
     except Exception as e:
-        # Update run to failed
+        # Check if run is still active before marking as failed
+        if not is_run_active(supabase, run_id):
+            log(f"Run {run_id} is no longer active, stopping before marking failed")
+            return
+        
+        # Update run to failed (only if still in 'running' status to prevent superseded runs from updating)
         finished_at = datetime.utcnow()
         error_message = str(e)[:500]  # Truncate to first 500 chars
         
@@ -129,7 +164,7 @@ def process_run(run_row, supabase):
                 "status": "failed",
                 "finished_at": finished_at.isoformat(),
                 "error_message": error_message
-            }).eq("id", run_id).execute()
+            }).eq("id", run_id).eq("status", "running").execute()
         except Exception as update_error:
             log(f"Error updating run {run_id} to failed: {str(update_error)}")
         
