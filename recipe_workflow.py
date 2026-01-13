@@ -25,6 +25,9 @@ TASK_FILTER_MATCH = "FILTER_MATCH"
 TASK_FILTER_NOT_MATCH = "FILTER_NOT_MATCH"
 TASK_COUNT_BY = "COUNT_BY"
 TASK_SORT = "SORT"
+TASK_REMOVE_CHARACTERS = "REMOVE_CHARACTERS"
+TASK_CONCATENATE = "CONCATENATE"
+TASK_MAP = "MAP"
 
 # Input sheet names (read-only)
 INPUT_SHEETS = {"URLs", "Contacts", "Master"}
@@ -297,6 +300,86 @@ def _parse_sort(task_name: str) -> Optional[Dict[str, Any]]:
     return {"sheet": sheet, "column": column, "direction": direction}
 
 
+def _parse_remove_characters(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Remove characters - (SheetName, ColumnName, "CharactersToRemove")' pattern.
+    
+    Returns:
+        Dict with 'sheet', 'column', and 'characters_to_remove' keys, or None if parse fails
+    """
+    # Pattern: Remove characters - (SheetName, ColumnName, "CharactersToRemove")
+    # Need to handle quoted string for characters_to_remove
+    pattern = r'^Remove characters\s*-\s*\(([^,]+),\s*([^,]+),\s*"([^"]+)"\)$'
+    match = re.match(pattern, task_name, re.IGNORECASE)
+    if not match:
+        return None
+    
+    sheet = match.group(1).strip()
+    column = match.group(2).strip()
+    characters_to_remove = match.group(3).strip()
+    
+    return {"sheet": sheet, "column": column, "characters_to_remove": characters_to_remove}
+
+
+def _parse_concatenate(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Concatenate - (SheetName, OutputColumnName, SourceColumn1, SourceColumn2, "Separator")' pattern.
+    
+    Returns:
+        Dict with 'sheet', 'output_column', 'source_column1', 'source_column2', and 'separator' keys, or None if parse fails
+    """
+    # Pattern: Concatenate - (SheetName, OutputColumnName, SourceColumn1, SourceColumn2, "Separator")
+    # Need to handle quoted string for separator
+    pattern = r'^Concatenate\s*-\s*\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*"([^"]+)"\)$'
+    match = re.match(pattern, task_name, re.IGNORECASE)
+    if not match:
+        return None
+    
+    sheet = match.group(1).strip()
+    output_column = match.group(2).strip()
+    source_column1 = match.group(3).strip()
+    source_column2 = match.group(4).strip()
+    separator = match.group(5).strip()
+    
+    return {
+        "sheet": sheet,
+        "output_column": output_column,
+        "source_column1": source_column1,
+        "source_column2": source_column2,
+        "separator": separator
+    }
+
+
+def _parse_map(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Map - (TargetSheet, TargetKeyColumn, LookupSheet, LookupKeyColumn, LookupValueColumn, TargetOutputColumn)' pattern.
+    
+    Returns:
+        Dict with 'target_sheet', 'target_key_column', 'lookup_sheet', 'lookup_key_column', 'lookup_value_column', and 'target_output_column' keys, or None if parse fails
+    """
+    # Pattern: Map - (TargetSheet, TargetKeyColumn, LookupSheet, LookupKeyColumn, LookupValueColumn, TargetOutputColumn)
+    pattern = r'^Map\s*-\s*\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)$'
+    match = re.match(pattern, task_name, re.IGNORECASE)
+    if not match:
+        return None
+    
+    target_sheet = match.group(1).strip()
+    target_key_column = match.group(2).strip()
+    lookup_sheet = match.group(3).strip()
+    lookup_key_column = match.group(4).strip()
+    lookup_value_column = match.group(5).strip()
+    target_output_column = match.group(6).strip()
+    
+    return {
+        "target_sheet": target_sheet,
+        "target_key_column": target_key_column,
+        "lookup_sheet": lookup_sheet,
+        "lookup_key_column": lookup_key_column,
+        "lookup_value_column": lookup_value_column,
+        "target_output_column": target_output_column
+    }
+
+
 def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Optional[str]:
     """
     Validate a parsed task according to the rules.
@@ -326,7 +409,7 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
             return f"Row {row_index}: Copy sheet target cannot be an input sheet, got '{target}'"
     
     elif task_type in (TASK_DEDUPLICATE, TASK_NORMALIZE_URLS, TASK_FILTER_INCLUDE, 
-                       TASK_FILTER_EXCLUDE, TASK_COUNT_BY, TASK_SORT):
+                       TASK_FILTER_EXCLUDE, TASK_COUNT_BY, TASK_SORT, TASK_REMOVE_CHARACTERS, TASK_CONCATENATE):
         sheet = params.get("sheet")
         
         # Sheet must be an output sheet
@@ -340,6 +423,17 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         # Both sheets must be output sheets
         if source_sheet not in OUTPUT_SHEETS:
             return f"Row {row_index}: Source sheet '{source_sheet}' must be an output sheet (URLs output or Contacts output)"
+        
+        if lookup_sheet not in OUTPUT_SHEETS:
+            return f"Row {row_index}: Lookup sheet '{lookup_sheet}' must be an output sheet (URLs output or Contacts output)"
+    
+    elif task_type == TASK_MAP:
+        target_sheet = params.get("target_sheet")
+        lookup_sheet = params.get("lookup_sheet")
+        
+        # Both sheets must be output sheets
+        if target_sheet not in OUTPUT_SHEETS:
+            return f"Row {row_index}: Target sheet '{target_sheet}' must be an output sheet (URLs output or Contacts output)"
         
         if lookup_sheet not in OUTPUT_SHEETS:
             return f"Row {row_index}: Lookup sheet '{lookup_sheet}' must be an output sheet (URLs output or Contacts output)"
@@ -429,6 +523,21 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             parsed = _parse_sort(task_name)
             if parsed:
                 task_type = TASK_SORT
+                params = parsed
+        elif task_name.lower().startswith("remove characters"):
+            parsed = _parse_remove_characters(task_name)
+            if parsed:
+                task_type = TASK_REMOVE_CHARACTERS
+                params = parsed
+        elif task_name.lower().startswith("concatenate"):
+            parsed = _parse_concatenate(task_name)
+            if parsed:
+                task_type = TASK_CONCATENATE
+                params = parsed
+        elif task_name.lower().startswith("map"):
+            parsed = _parse_map(task_name)
+            if parsed:
+                task_type = TASK_MAP
                 params = parsed
         
         # Check if parsing succeeded
@@ -709,6 +818,211 @@ def sort_rows(work: Dict[str, List[Dict[str, Any]]],
     rows.sort(key=sort_key, reverse=reverse)
 
 
+def remove_characters(work: Dict[str, List[Dict[str, Any]]],
+                      sheet: str,
+                      column: str,
+                      characters_to_remove: str) -> None:
+    """
+    Remove specified characters from a column in-place.
+    
+    For each row in the sheet, removes every occurrence of any character
+    in characters_to_remove from the column value. Writes the cleaned value
+    back into the same column.
+    
+    Examples:
+        - Input: "Aidan.?" with characters_to_remove=".?" → Output: "Aidan"
+        - Input: "Dr. Smith??" with characters_to_remove=".?" → Output: "Dr Smith"
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        sheet: Name of sheet in work
+        column: Column name to clean (modified in-place)
+        characters_to_remove: String containing characters to remove
+        
+    Raises:
+        ValueError: If the column doesn't exist in the sheet
+    """
+    if sheet not in work:
+        work[sheet] = []
+    
+    rows = work[sheet]
+    
+    # Validate that the column exists (check if it appears in any row)
+    column_exists = any(column in row for row in rows)
+    if not column_exists and len(rows) > 0:
+        raise ValueError(f"Column '{column}' does not exist in sheet '{sheet}'")
+    
+    # Build translation table to remove characters
+    # str.maketrans creates a translation table that maps each character to None
+    if characters_to_remove:
+        # Create a translation table: map each char to None (delete)
+        trans_table = str.maketrans('', '', characters_to_remove)
+    else:
+        # No characters to remove, return early
+        return
+    
+    for row in rows:
+        value = row.get(column)
+        # If the cell is empty/null/undefined, leave it as-is
+        if value is None or value == "":
+            continue
+        
+        # Convert to string and remove characters
+        value_str = str(value)
+        cleaned = value_str.translate(trans_table)
+        row[column] = cleaned
+
+
+def concatenate(work: Dict[str, List[Dict[str, Any]]],
+                sheet: str,
+                output_column: str,
+                source_column1: str,
+                source_column2: str,
+                separator: str) -> None:
+    """
+    Concatenate two source columns into an output column.
+    
+    For each row, combines source_column1 + separator + source_column2
+    and writes the result to output_column. If output_column doesn't exist,
+    it will be created.
+    
+    Examples:
+        - First Name="Aidan", Last Name="Pits", Separator=" " → "Aidan Pits"
+        - First Name="", Company="Stripe", Separator=" at " → " at Stripe"
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        sheet: Name of sheet in work
+        output_column: Column name to write concatenated result to
+        source_column1: First source column name
+        source_column2: Second source column name
+        separator: String to insert between the two values
+        
+    Raises:
+        ValueError: If either source column doesn't exist in the sheet
+    """
+    if sheet not in work:
+        work[sheet] = []
+    
+    rows = work[sheet]
+    
+    # Validate that source columns exist (check if they appear in any row)
+    if len(rows) > 0:
+        source1_exists = any(source_column1 in row for row in rows)
+        source2_exists = any(source_column2 in row for row in rows)
+        
+        if not source1_exists:
+            raise ValueError(f"Source column '{source_column1}' does not exist in sheet '{sheet}'")
+        if not source2_exists:
+            raise ValueError(f"Source column '{source_column2}' does not exist in sheet '{sheet}'")
+    
+    for row in rows:
+        # Fetch values, defaulting to empty string if missing/undefined
+        value1 = row.get(source_column1)
+        value2 = row.get(source_column2)
+        
+        # Convert to strings (handles None by converting to "")
+        value1_str = str(value1) if value1 is not None else ""
+        value2_str = str(value2) if value2 is not None else ""
+        
+        # Concatenate: value1 + separator + value2
+        result = value1_str + separator + value2_str
+        
+        # Write to output column
+        row[output_column] = result
+
+
+def map_task(work: Dict[str, List[Dict[str, Any]]],
+             target_sheet: str,
+             target_key_column: str,
+             lookup_sheet: str,
+             lookup_key_column: str,
+             lookup_value_column: str,
+             target_output_column: str) -> None:
+    """
+    Perform XLOOKUP-style mapping from lookup sheet to target sheet.
+    
+    Builds a lookup map from lookup_sheet using lookup_key_column as keys
+    and lookup_value_column as values. For each row in target_sheet, looks up
+    the value in target_key_column and writes the corresponding lookup value
+    to target_output_column.
+    
+    Example:
+        URLs output: Website="example.com", B2B/B2C="B2B"
+        Contacts output: Website="example.com", B2B/B2C=""
+        After Map: Contacts output.B2B/B2C = "B2B"
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        target_sheet: Name of target sheet in work
+        target_key_column: Column name in target sheet to use as lookup key
+        lookup_sheet: Name of lookup sheet in work
+        lookup_key_column: Column name in lookup sheet to use as lookup key
+        lookup_value_column: Column name in lookup sheet to use as lookup value
+        target_output_column: Column name in target sheet to write lookup result to
+        
+    Raises:
+        ValueError: If any required column doesn't exist in its respective sheet
+    """
+    if target_sheet not in work:
+        work[target_sheet] = []
+    if lookup_sheet not in work:
+        work[lookup_sheet] = []
+    
+    lookup_rows = work[lookup_sheet]
+    target_rows = work[target_sheet]
+    
+    # Validate that required columns exist as headers in their respective sheets
+    if len(lookup_rows) > 0:
+        lookup_key_exists = any(lookup_key_column in row for row in lookup_rows)
+        lookup_value_exists = any(lookup_value_column in row for row in lookup_rows)
+        
+        if not lookup_key_exists:
+            raise ValueError(f"Lookup key column '{lookup_key_column}' does not exist in sheet '{lookup_sheet}'")
+        if not lookup_value_exists:
+            raise ValueError(f"Lookup value column '{lookup_value_column}' does not exist in sheet '{lookup_sheet}'")
+    
+    if len(target_rows) > 0:
+        target_key_exists = any(target_key_column in row for row in target_rows)
+        
+        if not target_key_exists:
+            raise ValueError(f"Target key column '{target_key_column}' does not exist in sheet '{target_sheet}'")
+    
+    # Build lookup map: lookup_key -> lookup_value
+    # Normalize keys by treating them as strings and trimming
+    # If multiple rows have the same key, take the FIRST encountered value
+    lookup_map: Dict[str, Any] = {}
+    for row in lookup_rows:
+        key_raw = row.get(lookup_key_column)
+        if key_raw is None:
+            continue
+        
+        # Normalize key: String(value).trim() (case-sensitive)
+        key = str(key_raw).strip()
+        
+        # Only add if we haven't seen this key before (first occurrence wins)
+        if key and key not in lookup_map:
+            value = row.get(lookup_value_column)
+            lookup_map[key] = value
+    
+    # Apply lookup to target rows
+    for row in target_rows:
+        key_raw = row.get(target_key_column)
+        
+        # If TargetKeyColumn does not exist on the row or the value is empty/undefined:
+        # Leave TargetOutputColumn as-is (do not set an error; just skip)
+        if key_raw is None or key_raw == "":
+            continue
+        
+        # Normalize key: String(value).trim()
+        key = str(key_raw).strip()
+        
+        # If key exists in the lookup map, write the value
+        if key in lookup_map:
+            row[target_output_column] = lookup_map[key]
+        # Else: row[target_output_column] remains unchanged (or becomes undefined if not set before)
+
+
 def run_recipe(project_id: str,
                run_id: str,
                urls_rows: List[Dict[str, Any]],
@@ -829,6 +1143,32 @@ def run_recipe(project_id: str,
                     task.params["sheet"],
                     task.params["column"],
                     task.params["direction"]
+                )
+            elif task.type == TASK_REMOVE_CHARACTERS:
+                remove_characters(
+                    work,
+                    task.params["sheet"],
+                    task.params["column"],
+                    task.params["characters_to_remove"]
+                )
+            elif task.type == TASK_CONCATENATE:
+                concatenate(
+                    work,
+                    task.params["sheet"],
+                    task.params["output_column"],
+                    task.params["source_column1"],
+                    task.params["source_column2"],
+                    task.params["separator"]
+                )
+            elif task.type == TASK_MAP:
+                map_task(
+                    work,
+                    task.params["target_sheet"],
+                    task.params["target_key_column"],
+                    task.params["lookup_sheet"],
+                    task.params["lookup_key_column"],
+                    task.params["lookup_value_column"],
+                    task.params["target_output_column"]
                 )
             else:
                 raise ValueError(f"Unknown task type: {task.type}")
