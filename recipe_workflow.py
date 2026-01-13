@@ -586,24 +586,24 @@ def _parse_ai_task(task_name: str) -> Optional[Dict[str, Any]]:
     Syntax examples:
         Example 1 (unconditional):
             AI - URLs output | URLs output | GPT_Company_Summary | gpt-mini | """
-            Summarize what this company does in one sentence.
+            #Summarize what this company does in one sentence.
             
-            Company: {Company}
-            Website: {Website}
-            Short description: {Short Description}
+            #Company: {Company}
+            #Website: {Website}
+            #Short description: {Short Description}
             
-            Return a single plain-English sentence with no fluff.
+            #Return a single plain-English sentence with no fluff.
             """
         
         Example 2 (conditional):
             AI - URLs output | URLs output | GPT_Company_Summary | gpt-mini | WHEN {Segment} contains: "B2B" | """
-            Summarize what this company does in one sentence.
+            #Summarize what this company does in one sentence.
             
-            Company: {Company}
-            Website: {Website}
-            Short description: {Short Description}
+            #Company: {Company}
+            #Website: {Website}
+            #Short description: {Short Description}
             
-            Return a single plain-English sentence with no fluff.
+            #Return a single plain-English sentence with no fluff.
             """
     
     Returns:
