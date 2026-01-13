@@ -39,6 +39,7 @@ TASK_CONCATENATE = "CONCATENATE"
 TASK_MAP = "MAP"
 TASK_ASSIGN_OTHER = "ASSIGN_OTHER"
 TASK_COPY_BY_KEY = "COPY_BY_KEY"
+TASK_INSERT_COLUMN = "INSERT_COLUMN"
 TASK_AI = "AI"
 TASK_EXA = "EXA"
 
@@ -568,6 +569,48 @@ def _parse_copy_by_key(task_name: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _parse_insert_column(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Insert column - <SheetName> | <ColumnName>' pattern.
+    
+    Syntax examples:
+        Insert column - Contacts output | GPT_Notes
+        Insert column - URLs output | Segment Override
+    
+    Returns:
+        Dict with 'sheet_name' and 'column_name' keys, or None if parse fails
+    """
+    # Check if task name starts with "Insert column -" (case-insensitive)
+    if not task_name.lower().startswith("insert column -"):
+        return None
+    
+    # Remove the prefix and trim
+    prefix_len = len("Insert column -")
+    rest = task_name[prefix_len:].strip()
+    
+    if not rest:
+        return None
+    
+    # Split by pipe character
+    tokens = [token.strip() for token in rest.split("|")]
+    
+    # Must have exactly 2 tokens
+    if len(tokens) != 2:
+        return None
+    
+    sheet_name = tokens[0]
+    column_name = tokens[1]
+    
+    # Validate that all tokens are non-empty
+    if not sheet_name or not column_name:
+        return None
+    
+    return {
+        "sheet_name": sheet_name,
+        "column_name": column_name
+    }
+
+
 def _parse_exa_condition(condition_segment: str) -> Optional[Dict[str, str]]:
     """
     Parse a WHEN condition segment: 'WHEN {ColumnName} is not empty'
@@ -968,6 +1011,20 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         if target_sheet_name not in OUTPUT_SHEETS:
             return f"Row {row_index}: Target sheet '{target_sheet_name}' must be an output sheet (URLs output or Contacts output)"
     
+    elif task_type == TASK_INSERT_COLUMN:
+        sheet_name = params.get("sheet_name")
+        column_name = params.get("column_name")
+        
+        # Validate that all required fields are non-empty
+        if not sheet_name:
+            return f"Row {row_index}: Insert column task sheet_name is required"
+        if not column_name:
+            return f"Row {row_index}: Insert column task column_name is required"
+        
+        # Sheet must be an output sheet
+        if sheet_name not in OUTPUT_SHEETS:
+            return f"Row {row_index}: Operation on '{sheet_name}' is not allowed. Only output sheets (URLs output, Contacts output) can be used for non-copy operations"
+    
     elif task_type == TASK_AI:
         input_sheet_name = params.get("input_sheet_name")
         output_sheet_name = params.get("output_sheet_name")
@@ -1137,6 +1194,11 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             parsed = _parse_copy_by_key(task_name)
             if parsed:
                 task_type = TASK_COPY_BY_KEY
+                params = parsed
+        elif task_name.lower().startswith("insert column"):
+            parsed = _parse_insert_column(task_name)
+            if parsed:
+                task_type = TASK_INSERT_COLUMN
                 params = parsed
         elif task_name.lower().startswith("ai -"):
             parsed = _parse_ai_task(task_name)
@@ -1967,6 +2029,74 @@ def copy_by_key_task(work: Dict[str, List[Dict[str, Any]]],
                 row[col_name] = source_value
 
 
+def insert_column_task(work: Dict[str, List[Dict[str, Any]]],
+                       sheet_name: str,
+                       column_name: str,
+                       logger: Optional[Any] = None) -> Optional[str]:
+    """
+    Ensure that a given column exists on a given sheet.
+    
+    If the column doesn't exist, it is created and set to "" (empty string) for every row.
+    If it does exist, existing values are left as-is, but missing row keys are filled in as empty strings.
+    
+    This task does NOT:
+    - Delete columns
+    - Move column positions
+    - Change any values except to add "" where the column didn't exist
+    
+    Example:
+        Insert column - Contacts output | GPT_Notes
+        - Ensures that "GPT_Notes" exists on "Contacts output"
+        - If it doesn't exist, creates it and sets "" for every row
+        - If it already exists, leaves values as-is and backfills missing keys as ""
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        sheet_name: Name of sheet in work
+        column_name: Name of column to ensure exists
+        logger: Optional logger for debug logging
+        
+    Returns:
+        Error message string if an error occurred, None if successful
+    """
+    # Step 1: Fetch sheet
+    rows = work.get(sheet_name)
+    
+    if rows is None:
+        error_msg = f"Sheet '{sheet_name}' not found"
+        if logger:
+            logger.debug(f"insert_column_task: {error_msg}")
+        return error_msg
+    
+    try:
+        # Step 2: Check if column exists
+        # Determine whether column_name exists in the sheet
+        # Check if any row has that key
+        column_exists = False
+        if len(rows) > 0:
+            column_exists = any(column_name in row for row in rows)
+        
+        # Step 3: If column does NOT exist, create it with empty strings for all rows
+        if not column_exists:
+            for row in rows:
+                row[column_name] = ""
+        else:
+            # Step 4: If column DOES exist, ensure every row has a key for this column
+            # Backfill missing keys with empty strings
+            for row in rows:
+                if column_name not in row:
+                    row[column_name] = ""
+        
+        # No other changes - we don't alter other columns, reorder rows, or perform any I/O
+        return None
+    except Exception as e:
+        # Step 6: Error handling - catch unexpected exceptions
+        error_msg = f"Unexpected error in insert_column_task: {str(e)}"
+        if logger:
+            logger.debug(f"insert_column_task: {error_msg}")
+        return error_msg
+
+
 def _map_model_name(model_name: str) -> str:
     """
     Map user-friendly model names to OpenRouter model identifiers.
@@ -2660,6 +2790,21 @@ def run_recipe(project_id: str,
                     task.params["target_sheet_name"],
                     task.params["target_key_column"]
                 )
+            elif task.type == TASK_INSERT_COLUMN:
+                try:
+                    error_msg = insert_column_task(
+                        work,
+                        task.params["sheet_name"],
+                        task.params["column_name"]
+                    )
+                    if error_msg:
+                        # Record task-level error but don't crash the recipe
+                        errors.append(f"Row {task.row_index}: {error_msg}")
+                        continue
+                except Exception as e:
+                    # Catch any unexpected exceptions and handle gracefully
+                    errors.append(f"Row {task.row_index}: Insert column task failed: {str(e)}")
+                    continue
             elif task.type == TASK_AI:
                 # AI tasks are async, so we need to run them in an event loop
                 # Since run_recipe is sync, we use asyncio.run()
@@ -2711,6 +2856,16 @@ def run_recipe(project_id: str,
     # Extract final results
     urls_output_rows = work.get("URLs output") or []
     contacts_output_rows = work.get("Contacts output") or []
+    
+    # Check if there were any runtime errors (e.g., from insert_column_task)
+    if errors:
+        return {
+            "ok": False,
+            "errors": errors,
+            "urls_output": None,
+            "contacts_output": None,
+            "master_status_updates": None,
+        }
     
     return {
         "ok": True,
