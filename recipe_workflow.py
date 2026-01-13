@@ -17,6 +17,7 @@ from typing import List, Dict, Any, Tuple, Optional, Callable
 from urllib.parse import urlparse
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
+from exa_py import Exa
 
 # Load environment variables for AI client
 load_dotenv()
@@ -37,6 +38,7 @@ TASK_CONCATENATE = "CONCATENATE"
 TASK_MAP = "MAP"
 TASK_ASSIGN_OTHER = "ASSIGN_OTHER"
 TASK_AI = "AI"
+TASK_EXA = "EXA"
 
 # Input sheet names (read-only)
 INPUT_SHEETS = {"URLs", "Contacts", "Master"}
@@ -454,6 +456,61 @@ def _parse_assign_other(task_name: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _parse_exa_condition(condition_segment: str) -> Optional[Dict[str, str]]:
+    """
+    Parse a WHEN condition segment: 'WHEN {ColumnName} is not empty'
+    
+    Args:
+        condition_segment: The condition segment string (e.g., 'WHEN {Short Description} is not empty')
+        
+    Returns:
+        Dict with 'column_name' and 'type' keys, or None if parse fails
+    """
+    condition_segment = condition_segment.strip()
+    
+    # Must start with WHEN (case-insensitive)
+    if not condition_segment.lower().startswith("when"):
+        return None
+    
+    # Remove WHEN prefix and trim
+    after_when = condition_segment[4:].strip()
+    if not after_when:
+        return None
+    
+    # Expect placeholder {ColumnName}
+    if not after_when.startswith("{") or "}" not in after_when:
+        return None
+    
+    # Extract column name from placeholder
+    placeholder_end = after_when.find("}")
+    if placeholder_end == -1:
+        return None
+    
+    column_name = after_when[1:placeholder_end].strip()
+    if not column_name:
+        return None
+    
+    # After placeholder, expect space and "is not empty" (case-insensitive)
+    after_placeholder = after_when[placeholder_end + 1:].strip()
+    after_placeholder_lower = after_placeholder.lower()
+    
+    # Check if it matches "is not empty" (case-insensitive, allowing extra spaces)
+    if "is not empty" not in after_placeholder_lower:
+        return None
+    
+    # Normalize: remove "is not empty" and check if only whitespace remains
+    # This ensures the tail is exactly "is not empty" (with optional surrounding spaces)
+    normalized_tail = after_placeholder_lower.replace("is not empty", "").strip()
+    if normalized_tail:
+        # There's extra text after "is not empty" - invalid
+        return None
+    
+    return {
+        "column_name": column_name,
+        "type": "is_not_empty"
+    }
+
+
 def _parse_ai_condition(condition_segment: str) -> Optional[Dict[str, str]]:
     """
     Parse a WHEN condition segment: 'WHEN {ColumnName} contains: "Some Text"'
@@ -628,6 +685,72 @@ def _parse_ai_task(task_name: str) -> Optional[Dict[str, Any]]:
     return result
 
 
+def _parse_exa_task(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse Exa task pattern with optional WHEN condition.
+    
+    Supports two formats:
+    1. Unconditional: 'Exa - <SheetName> | <WebsiteColumn> | <OutputColumn>'
+    2. Conditional: 'Exa - <SheetName> | <WebsiteColumn> | <OutputColumn> | WHEN {ColumnName} is not empty'
+    
+    Syntax examples:
+        Example 1 (unconditional):
+            Exa - URLs output | Website | Exa Summary
+        
+        Example 2 (conditional):
+            Exa - URLs output | Website | Exa Summary | WHEN {Short Description} is not empty
+    
+    Returns:
+        Dict with 'sheet_name', 'website_column', 'output_column', and optionally 'condition',
+        or None if parse fails
+    """
+    # Check if task name starts with "Exa -" (case-insensitive)
+    if not task_name.lower().startswith("exa -"):
+        return None
+    
+    # Remove the prefix and trim
+    prefix_len = len("Exa -")
+    rest = task_name[prefix_len:].strip()
+    
+    if not rest:
+        return None
+    
+    # Split by pipe character
+    tokens = [token.strip() for token in rest.split("|")]
+    
+    # We expect either 3 tokens (unconditional) or 4 tokens (conditional)
+    if len(tokens) not in (3, 4):
+        return None
+    
+    sheet_name = tokens[0]
+    website_column = tokens[1]
+    output_column = tokens[2]
+    
+    # Validate that required fields are non-empty
+    if not sheet_name or not website_column or not output_column:
+        return None
+    
+    # Parse condition if present (4 tokens = conditional)
+    condition = None
+    if len(tokens) == 4:
+        condition_segment = tokens[3]
+        condition = _parse_exa_condition(condition_segment)
+        if condition is None:
+            return None  # Invalid condition syntax
+    
+    result = {
+        "sheet_name": sheet_name,
+        "website_column": website_column,
+        "output_column": output_column
+    }
+    
+    # Add condition if present
+    if condition is not None:
+        result["condition"] = condition
+    
+    return result
+
+
 def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Optional[str]:
     """
     Validate a parsed task according to the rules.
@@ -724,6 +847,28 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         # Input sheet must exist in inputs or work (we'll check at runtime if it's in work)
         # Output sheet should be an output sheet (but we allow any sheet that exists)
         # For now, we just validate they're non-empty strings
+    
+    elif task_type == TASK_EXA:
+        sheet_name = params.get("sheet_name")
+        website_column = params.get("website_column")
+        output_column = params.get("output_column")
+        condition = params.get("condition")
+        
+        # Validate that all required fields are non-empty
+        if not sheet_name:
+            return f"Row {row_index}: Exa task sheet_name is required"
+        if not website_column:
+            return f"Row {row_index}: Exa task website_column is required"
+        if not output_column:
+            return f"Row {row_index}: Exa task output_column is required"
+        
+        # Validate condition if present
+        if condition is not None:
+            condition_column_name = condition.get("column_name")
+            if not condition_column_name:
+                return f"Row {row_index}: Exa task condition column_name is required when condition is present"
+            # Note: We don't validate that the column exists at parse time,
+            # since sheet headers are validated at runtime when data is present
     
     return None
 
@@ -835,6 +980,11 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             parsed = _parse_ai_task(task_name)
             if parsed:
                 task_type = TASK_AI
+                params = parsed
+        elif task_name.lower().startswith("exa -"):
+            parsed = _parse_exa_task(task_name)
+            if parsed:
+                task_type = TASK_EXA
                 params = parsed
         
         # Check if parsing succeeded
@@ -1700,6 +1850,225 @@ async def run_ai_task(
         # Note: We continue even if some rows fail (exceptions are caught by gather)
 
 
+async def _call_exa_with_retry(
+    exa_client: Exa,
+    website: str,
+    max_retries: int = 3,
+    backoff_delays: List[float] = None
+) -> Optional[str]:
+    """
+    Call Exa API with retry logic and exponential backoff.
+    
+    Args:
+        exa_client: Exa client instance
+        website: The website URL to summarize
+        max_retries: Maximum number of retry attempts
+        backoff_delays: List of delay seconds for each retry (default: [1, 2])
+        
+    Returns:
+        Summary text or None if all attempts fail
+    """
+    if backoff_delays is None:
+        backoff_delays = [1, 2]
+    
+    # Normalize website URL
+    normalized_website = website.strip()
+    if not normalized_website:
+        return None
+    
+    # Ensure website has protocol
+    if not normalized_website.startswith(('http://', 'https://')):
+        normalized_website = f"https://{normalized_website}"
+    
+    for attempt in range(max_retries):
+        try:
+            # Call Exa.AI to get summary
+            # Note: Exa client is synchronous, so we run it in a thread to avoid blocking
+            response = await asyncio.to_thread(
+                exa_client.search_and_contents,
+                query=f"company information about {normalized_website}",
+                contents={
+                    "text": {"max_characters": 1000}
+                },
+                num_results=1
+            )
+            
+            if response.results and len(response.results) > 0:
+                # Extract text content from the first result
+                result = response.results[0]
+                if hasattr(result, 'text') and result.text:
+                    return result.text
+                elif hasattr(result, 'id'):
+                    # If no text, try to get content from ID
+                    content_response = await asyncio.to_thread(
+                        exa_client.get_contents,
+                        ids=[result.id],
+                        text={"max_characters": 1000}
+                    )
+                    if content_response.results and len(content_response.results) > 0:
+                        return content_response.results[0].text
+            
+            return None
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+                await asyncio.sleep(delay)
+            else:
+                # Last attempt failed
+                return None
+    
+    return None
+
+
+async def run_exa_task(
+    work: Dict[str, List[Dict[str, Any]]],
+    task: RecipeTask,
+    exa_client: Exa,
+    semaphore: asyncio.Semaphore
+) -> None:
+    """
+    Execute an Exa recipe task with optional conditional execution.
+    
+    This function:
+    1. Reads input sheet data
+    2. For each row, evaluates condition if present (skips row if condition is false)
+    3. Checks if website is non-empty and output column is empty (idempotent)
+    4. Calls Exa API with batching, concurrency limits, and retries
+    5. Writes results to output column
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        task: RecipeTask with type TASK_EXA and params containing:
+            - sheet_name: Name of sheet to process
+            - website_column: Name of column containing website URLs
+            - output_column: Name of column to write results to
+            - condition: Optional dict with 'column_name' and 'type' for conditional execution
+        exa_client: Exa client instance
+        semaphore: Semaphore to limit concurrent Exa requests
+        
+    Raises:
+        ValueError: If sheet is not found or other configuration errors
+    """
+    sheet_name = task.params["sheet_name"]
+    website_column = task.params["website_column"]
+    output_column = task.params["output_column"]
+    condition = task.params.get("condition")  # Optional condition
+    
+    # Resolve sheet
+    rows = work.get(sheet_name)
+    if rows is None:
+        raise ValueError(f"Sheet '{sheet_name}' not found in work dictionary")
+    
+    # Determine column headers from first row (if available)
+    column_headers = set()
+    if len(rows) > 0:
+        column_headers = set(rows[0].keys())
+    
+    # Validate that website_column exists
+    if len(rows) > 0 and website_column not in column_headers:
+        raise ValueError(f"Website column '{website_column}' not found in sheet '{sheet_name}'")
+    
+    # Ensure output_column exists in all rows
+    for row in rows:
+        if output_column not in row:
+            row[output_column] = ""
+    
+    # Helper function to evaluate condition for a row
+    def evaluate_condition(row: Dict[str, Any]) -> bool:
+        """
+        Evaluate the condition for a row.
+        
+        Returns:
+            True if condition is None (unconditional) or if condition evaluates to True.
+            False if condition evaluates to False.
+        """
+        if condition is None:
+            return True  # Unconditional: process all rows
+        
+        # Get condition column value
+        condition_column_name = condition["column_name"]
+        condition_type = condition["type"]
+        
+        # Get value from row (stringified, trimmed)
+        row_value = row.get(condition_column_name)
+        if row_value is None:
+            row_value = ""
+        else:
+            row_value = str(row_value).strip()
+        
+        # Evaluate based on condition type
+        if condition_type == "is_not_empty":
+            return len(row_value) > 0
+        
+        # Unknown condition type
+        return False
+    
+    # Process each row
+    async def process_row(row_index: int, row: Dict[str, Any]) -> None:
+        """Process a single row: check condition, check website/output, call Exa, write result."""
+        try:
+            # Evaluate condition first - if false, skip this row entirely
+            if not evaluate_condition(row):
+                # Condition is false: skip this row, leave output cell unchanged
+                return
+            
+            # Get website value
+            website = row.get(website_column)
+            if website is None:
+                website = ""
+            else:
+                website = str(website).strip()
+            
+            # If website is empty, skip this row
+            if not website:
+                return
+            
+            # Check if output column already has a non-empty value (idempotent behavior)
+            current_output = row.get(output_column)
+            if current_output is not None:
+                current_output_str = str(current_output).strip()
+                if current_output_str:
+                    # Output already populated, skip to avoid re-calling Exa
+                    return
+            
+            # Call Exa with semaphore for concurrency control
+            async with semaphore:
+                exa_summary = await _call_exa_with_retry(exa_client, website)
+            
+            # Write result to output column
+            # If Exa call failed, leave empty (or optionally set error marker)
+            if exa_summary is None:
+                # Leave empty on failure (per spec: don't overwrite with error markers)
+                row[output_column] = ""
+            else:
+                row[output_column] = exa_summary
+                
+        except Exception as e:
+            # Per-row error: leave output empty and continue processing other rows
+            # This ensures one row failure doesn't crash the entire task
+            row[output_column] = ""
+            # Note: We don't log here since we don't have a logger in this context
+            # The caller can handle logging if needed
+    
+    # Process all rows concurrently (with semaphore limiting concurrency)
+    # Batch processing: process in chunks to avoid overwhelming the system
+    batch_size = 50
+    for batch_start in range(0, len(rows), batch_size):
+        batch_end = min(batch_start + batch_size, len(rows))
+        batch_rows = rows[batch_start:batch_end]
+        
+        # Process batch concurrently
+        tasks = [
+            process_row(batch_start + i, row)
+            for i, row in enumerate(batch_rows)
+        ]
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Note: We continue even if some rows fail (exceptions are caught by gather)
+
+
 def run_recipe(project_id: str,
                run_id: str,
                urls_rows: List[Dict[str, Any]],
@@ -1783,6 +2152,28 @@ def run_recipe(project_id: str,
         
         # Create semaphore for concurrency control (5 concurrent requests, same as enrichment)
         ai_semaphore = asyncio.Semaphore(5)
+    
+    # Initialize Exa client and semaphore (only if we have Exa tasks)
+    exa_client = None
+    exa_semaphore = None
+    has_exa_tasks = any(task.type == TASK_EXA for task in tasks)
+    
+    if has_exa_tasks:
+        # Initialize Exa client (same pattern as enrich_workflow)
+        exa_api_key = os.getenv("EXA_API_KEY")
+        if not exa_api_key:
+            return {
+                "ok": False,
+                "errors": ["EXA_API_KEY environment variable is required for Exa tasks"],
+                "urls_output": None,
+                "contacts_output": None,
+                "master_status_updates": None,
+            }
+        
+        exa_client = Exa(api_key=exa_api_key)
+        
+        # Create semaphore for concurrency control (5 concurrent requests, same as enrichment)
+        exa_semaphore = asyncio.Semaphore(5)
     
     try:
         for task in tasks:
@@ -1892,6 +2283,15 @@ def run_recipe(project_id: str,
                     asyncio.run(run_ai_task(work, task, ai_client, ai_semaphore))
                 except Exception as e:
                     raise ValueError(f"AI task failed on row {task.row_index}: {str(e)}")
+            elif task.type == TASK_EXA:
+                # Exa tasks are async, so we need to run them in an event loop
+                # Since run_recipe is sync, we use asyncio.run()
+                # Note: asyncio.run() creates a new event loop, so this is safe even if
+                # called from a sync context (which is the case in worker.py)
+                try:
+                    asyncio.run(run_exa_task(work, task, exa_client, exa_semaphore))
+                except Exception as e:
+                    raise ValueError(f"Exa task failed on row {task.row_index}: {str(e)}")
             else:
                 raise ValueError(f"Unknown task type: {task.type}")
             
