@@ -585,7 +585,7 @@ def _parse_ai_task(task_name: str) -> Optional[Dict[str, Any]]:
     
     Syntax examples:
         Example 1 (unconditional):
-            AI - URLs output | URLs output | GPT_Company_Summary | gpt-mini | """
+            AI - URLs output | URLs output | GPT_Company_Summary | gpt-mini | \"\"\"
             #Summarize what this company does in one sentence.
             
             #Company: {Company}
@@ -593,10 +593,10 @@ def _parse_ai_task(task_name: str) -> Optional[Dict[str, Any]]:
             #Short description: {Short Description}
             
             #Return a single plain-English sentence with no fluff.
-            """
+            \"\"\"
         
         Example 2 (conditional):
-            AI - URLs output | URLs output | GPT_Company_Summary | gpt-mini | WHEN {Segment} contains: "B2B" | """
+            AI - URLs output | URLs output | GPT_Company_Summary | gpt-mini | WHEN {Segment} contains: "B2B" | \"\"\"
             #Summarize what this company does in one sentence.
             
             #Company: {Company}
@@ -604,7 +604,7 @@ def _parse_ai_task(task_name: str) -> Optional[Dict[str, Any]]:
             #Short description: {Short Description}
             
             #Return a single plain-English sentence with no fluff.
-            """
+            \"\"\"
     
     Returns:
         Dict with 'input_sheet_name', 'output_sheet_name', 'output_column_name', 'model_name', 'prompt_template',
