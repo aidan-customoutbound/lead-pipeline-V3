@@ -28,6 +28,7 @@ TASK_SORT = "SORT"
 TASK_REMOVE_CHARACTERS = "REMOVE_CHARACTERS"
 TASK_CONCATENATE = "CONCATENATE"
 TASK_MAP = "MAP"
+TASK_ASSIGN_OTHER = "ASSIGN_OTHER"
 
 # Input sheet names (read-only)
 INPUT_SHEETS = {"URLs", "Contacts", "Master"}
@@ -380,6 +381,71 @@ def _parse_map(task_name: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _parse_assign_other(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Assign other - <SheetName> | <GroupByColumn> | <Source1>:<Dest1> | <Source2>:<Dest2> | ...' pattern.
+    
+    Syntax example:
+        Assign other - Contacts | WebsiteImport | First Name:Other First | Full Name:Other Full | Focus:Other Focus
+    
+    Returns:
+        Dict with 'sheet_name', 'group_column', and 'mappings' (list of {source, dest} dicts) keys, or None if parse fails
+    """
+    # Check if task name starts with "Assign other -" (case-insensitive)
+    if not task_name.lower().startswith("assign other -"):
+        return None
+    
+    # Remove the prefix and split by pipe
+    prefix_len = len("Assign other -")
+    rest = task_name[prefix_len:].strip()
+    
+    if not rest:
+        return None
+    
+    # Split by pipe character
+    tokens = [token.strip() for token in rest.split("|")]
+    
+    # Need at least: sheet_name, group_column, and one mapping pair
+    if len(tokens) < 3:
+        return None
+    
+    sheet_name = tokens[0]
+    group_column = tokens[1]
+    
+    # Parse mapping pairs (tokens[2:] onwards)
+    mappings = []
+    for token in tokens[2:]:
+        if not token:
+            return None  # Empty token is invalid
+        
+        # Each token must contain exactly one colon
+        if ":" not in token:
+            return None
+        
+        parts = token.split(":", 1)  # Split on first colon only
+        if len(parts) != 2:
+            return None
+        
+        source = parts[0].strip()
+        dest = parts[1].strip()
+        
+        # Both sides must be non-empty
+        if not source or not dest:
+            return None
+        
+        mappings.append({"source": source, "dest": dest})
+    
+    # Must have at least one mapping pair
+    if not mappings:
+        return None
+    
+    return {
+        "sheet_name": sheet_name,
+        "group_column": group_column,
+        "mappings": mappings
+    }
+
+
 def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Optional[str]:
     """
     Validate a parsed task according to the rules.
@@ -437,6 +503,13 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         
         if lookup_sheet not in OUTPUT_SHEETS:
             return f"Row {row_index}: Lookup sheet '{lookup_sheet}' must be an output sheet (URLs output or Contacts output)"
+    
+    elif task_type == TASK_ASSIGN_OTHER:
+        sheet_name = params.get("sheet_name")
+        
+        # Sheet must be an output sheet
+        if sheet_name not in OUTPUT_SHEETS:
+            return f"Row {row_index}: Operation on '{sheet_name}' is not allowed. Only output sheets (URLs output, Contacts output) can be used for non-copy operations"
     
     return None
 
@@ -538,6 +611,11 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             parsed = _parse_map(task_name)
             if parsed:
                 task_type = TASK_MAP
+                params = parsed
+        elif task_name.lower().startswith("assign other"):
+            parsed = _parse_assign_other(task_name)
+            if parsed:
+                task_type = TASK_ASSIGN_OTHER
                 params = parsed
         
         # Check if parsing succeeded
@@ -932,6 +1010,132 @@ def concatenate(work: Dict[str, List[Dict[str, Any]]],
         row[output_column] = result
 
 
+def assign_other_task(work: Dict[str, List[Dict[str, Any]]],
+                      sheet_name: str,
+                      group_column: str,
+                      mappings: List[Dict[str, str]]) -> None:
+    """
+    Assign "other" colleague information to each row within each group using circular rotation.
+    
+    This task implements the same logic as the earlier Google Apps Script function ("otherInformation"),
+    but generalized and scalable to handle a variable number of column-mapping pairs.
+    
+    Syntax example:
+        Assign other - Contacts | WebsiteImport | First Name:Other First | Full Name:Other Full | Focus:Other Focus
+    
+    Behavior:
+    1. Load all rows for the given sheet from in-memory sheet data.
+    2. Group rows by the value in group_column (String(value).trim()).
+       - Skip rows with empty grouping key.
+    3. For each group:
+       - If fewer than 2 valid rows → skip group.
+       - Identify "valid rows" as those where ALL source columns exist.
+       - Perform circular rotation: For row i → assign data from row (i+1), (i+2), ... until a different row is found.
+         (Do NOT assign a row to itself.)
+       - If only one unique row has non-empty source fields → skip group.
+    4. For each mapping pair <Source>:<Dest>:
+       - Read sourceColumn value from colleague row.
+       - Write into Dest column of current row.
+       - Create the destination column if it doesn't exist yet in the row dict.
+       - Leave blank if the assigned colleague has no value.
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        sheet_name: Name of sheet in work to process
+        group_column: Column name to group rows by
+        mappings: List of dicts with 'source' and 'dest' keys for column mappings
+    """
+    if sheet_name not in work:
+        work[sheet_name] = []
+    
+    rows = work[sheet_name]
+    
+    # Extract source columns from mappings for validation
+    source_columns = [m["source"] for m in mappings]
+    
+    # Step 1: Group rows by group_column value
+    # Convert values to String(value).trim() before grouping
+    # Skip rows with empty grouping key
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        group_key_raw = row.get(group_column)
+        if group_key_raw is None:
+            continue
+        
+        group_key = str(group_key_raw).strip()
+        if not group_key:
+            continue  # Skip rows with empty grouping key
+        
+        if group_key not in groups:
+            groups[group_key] = []
+        groups[group_key].append(row)
+    
+    # Step 2: Process each group
+    for group_key, group_rows in groups.items():
+        # Step 2a: Filter to valid rows (rows where ALL source columns exist)
+        valid_rows = []
+        for row in group_rows:
+            # Check if all source columns exist in this row
+            if all(source_col in row for source_col in source_columns):
+                valid_rows.append(row)
+        
+        # Step 2b: If fewer than 2 valid rows → skip group
+        if len(valid_rows) < 2:
+            continue
+        
+        # Step 2c: Check if only one unique row has non-empty source fields
+        # We'll check this by comparing the source values
+        unique_source_combinations = set()
+        for row in valid_rows:
+            # Create a tuple of all source values for this row
+            source_values = tuple(_safe_str(row.get(src_col)) for src_col in source_columns)
+            unique_source_combinations.add(source_values)
+        
+        # If only one unique combination of source values → skip group
+        if len(unique_source_combinations) <= 1:
+            continue
+        
+        # Step 2d: Perform circular rotation
+        # For each row i, assign data from row (i+1), wrapping around
+        # We need to preserve the original order of valid_rows
+        num_valid = len(valid_rows)
+        
+        for i, current_row in enumerate(valid_rows):
+            # Find the next different row (circular)
+            # Start from (i+1) and wrap around
+            colleague_row = None
+            for offset in range(1, num_valid):
+                next_idx = (i + offset) % num_valid
+                candidate_row = valid_rows[next_idx]
+                
+                # Check if this candidate has different source values
+                current_sources = tuple(_safe_str(current_row.get(src_col)) for src_col in source_columns)
+                candidate_sources = tuple(_safe_str(candidate_row.get(src_col)) for src_col in source_columns)
+                
+                if current_sources != candidate_sources:
+                    colleague_row = candidate_row
+                    break
+            
+            # If no different row found, skip this row (shouldn't happen given our check above)
+            if colleague_row is None:
+                continue
+            
+            # Step 3: For each mapping pair, assign values
+            for mapping in mappings:
+                source_col = mapping["source"]
+                dest_col = mapping["dest"]
+                
+                # Read source value from colleague row
+                source_value = colleague_row.get(source_col)
+                
+                # Write to destination column (create if doesn't exist)
+                # Leave blank if colleague has no value (None)
+                if source_value is None:
+                    current_row[dest_col] = ""
+                else:
+                    current_row[dest_col] = source_value
+
+
 def map_task(work: Dict[str, List[Dict[str, Any]]],
              target_sheet: str,
              target_key_column: str,
@@ -1169,6 +1373,13 @@ def run_recipe(project_id: str,
                     task.params["lookup_key_column"],
                     task.params["lookup_value_column"],
                     task.params["target_output_column"]
+                )
+            elif task.type == TASK_ASSIGN_OTHER:
+                assign_other_task(
+                    work,
+                    task.params["sheet_name"],
+                    task.params["group_column"],
+                    task.params["mappings"]
                 )
             else:
                 raise ValueError(f"Unknown task type: {task.type}")
