@@ -4,6 +4,7 @@ FastAPI web server for receiving HTTP POST requests from Google Sheets.
 Endpoints:
 - POST /upload: Trigger upload_csv.py for a given project_id
 - POST /start: Queue enrichment workflow for a given project_id
+- POST /stop: Cancel any queued or running runs for a given project_id
 """
 
 import csv
@@ -316,6 +317,80 @@ async def start_endpoint(request: Request) -> JSONResponse:
         raise
     except Exception as e:
         logger.error(f"Error in /start endpoint: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+
+@app.post("/stop")
+async def stop_endpoint(request: Request) -> JSONResponse:
+    """
+    Cancel any queued or running runs for a given project_id.
+    
+    Request body (JSON):
+    {
+        "project_id": "...",
+        "secret": "..."
+    }
+    
+    Returns:
+        JSON response with project_id and stopped_runs count
+    """
+    try:
+        # Parse request body
+        body = await request.json()
+        project_id = body.get("project_id")
+        secret = body.get("secret")
+        
+        # Log request
+        timestamp = datetime.utcnow().isoformat()
+        logger.info(f"[{timestamp}] POST /stop - project_id={project_id}")
+        
+        # Validate required fields
+        if not project_id or not project_id.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="project_id is required"
+            )
+        
+        # Validate secret
+        validate_secret(secret)
+        
+        # Create Supabase client for runs table
+        supabase = get_supabase_client()
+        
+        # Update runs table: mark queued/running runs as superseded
+        finished_at = datetime.utcnow()
+        try:
+            stop_response = supabase.table("runs").update({
+                "status": "superseded",
+                "finished_at": finished_at.isoformat(),
+                "error_message": "Stopped via /stop endpoint"
+            }).eq("project_id", project_id).in_("status", ["queued", "running"]).execute()
+            
+            stopped_count = len(stop_response.data) if stop_response.data else 0
+            logger.info(f"Stopped {stopped_count} queued/running run(s) for project_id={project_id}")
+            
+        except Exception as e:
+            logger.error(f"Error stopping runs: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to stop runs"
+            )
+        
+        logger.info(f"[{timestamp}] POST /stop - SUCCESS - project_id={project_id}, stopped_runs={stopped_count}")
+        
+        return JSONResponse(content={
+            "project_id": project_id,
+            "stopped_runs": stopped_count
+        })
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Error in /stop endpoint: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Internal server error: {str(e)}"

@@ -11,7 +11,7 @@ All Supabase and Google Sheets I/O is handled by the caller.
 
 import re
 from dataclasses import dataclass
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Callable
 from urllib.parse import urlparse
 
 
@@ -713,7 +713,8 @@ def run_recipe(project_id: str,
                run_id: str,
                urls_rows: List[Dict[str, Any]],
                contacts_rows: List[Dict[str, Any]],
-               master_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+               master_rows: List[Dict[str, Any]],
+               progress_callback: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
     """
     Main entry point for the recipe engine.
     
@@ -728,6 +729,7 @@ def run_recipe(project_id: str,
         urls_rows: Snapshot of URLs sheet rows
         contacts_rows: Snapshot of Contacts sheet rows
         master_rows: Snapshot of Master sheet rows
+        progress_callback: Optional callback function(row_index: int, status: str) called after each task completes
         
     Returns:
         Dictionary with keys:
@@ -836,6 +838,16 @@ def run_recipe(project_id: str,
                 "row_index": task.row_index,
                 "status": "completed"
             })
+            
+            # Call progress callback if provided
+            if progress_callback is not None:
+                try:
+                    progress_callback(task.row_index, "COMPLETED")
+                except Exception as callback_error:
+                    # Log callback errors but don't fail the recipe
+                    # Note: We don't have a logger here, so we'll just continue
+                    # The caller can handle logging if needed
+                    pass
     
     except Exception as e:
         # Catch runtime errors and return immediately

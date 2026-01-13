@@ -175,6 +175,23 @@ def process_run(run_row, supabase):
                 log(f"Run {run_id} is no longer active, stopping before running recipe")
                 return
             
+            # Define progress callback for real-time status updates
+            def recipe_progress_callback(row_index: int, status: str) -> None:
+                # 1) If run has been superseded, do nothing
+                if not is_run_active(supabase, run_id):
+                    return
+                
+                try:
+                    # Use the existing update_master_statuses helper
+                    update_master_statuses(
+                        service,
+                        sheet_id,
+                        "Master",
+                        [{"row_index": row_index, "status": status}],
+                    )
+                except Exception as e:
+                    log(f"[recipe] Warning: failed to update Master status for row {row_index}: {e}")
+            
             # Run the recipe workflow
             log(f"[worker] Running recipe_workflow.run_recipe(...)")
             result = recipe_workflow.run_recipe(
@@ -182,7 +199,8 @@ def process_run(run_row, supabase):
                 run_id=run_id,
                 urls_rows=urls_rows,
                 contacts_rows=contacts_rows,
-                master_rows=master_rows
+                master_rows=master_rows,
+                progress_callback=recipe_progress_callback
             )
             
             # Check if run is still active after recipe execution
