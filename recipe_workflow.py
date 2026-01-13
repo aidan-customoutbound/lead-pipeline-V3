@@ -454,12 +454,80 @@ def _parse_assign_other(task_name: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _parse_ai_condition(condition_segment: str) -> Optional[Dict[str, str]]:
+    """
+    Parse a WHEN condition segment: 'WHEN {ColumnName} contains: "Some Text"'
+    
+    Args:
+        condition_segment: The condition segment string (e.g., 'WHEN {Segment} contains: "B2B"')
+        
+    Returns:
+        Dict with 'column_name' and 'substring' keys, or None if parse fails
+    """
+    condition_segment = condition_segment.strip()
+    
+    # Must start with WHEN (case-insensitive)
+    if not condition_segment.lower().startswith("when"):
+        return None
+    
+    # Remove WHEN prefix and trim
+    after_when = condition_segment[4:].strip()
+    if not after_when:
+        return None
+    
+    # Expect placeholder {ColumnName}
+    if not after_when.startswith("{") or "}" not in after_when:
+        return None
+    
+    # Extract column name from placeholder
+    placeholder_end = after_when.find("}")
+    if placeholder_end == -1:
+        return None
+    
+    column_name = after_when[1:placeholder_end].strip()
+    if not column_name:
+        return None
+    
+    # After placeholder, expect space and "contains:" (case-insensitive)
+    after_placeholder = after_when[placeholder_end + 1:].strip()
+    after_placeholder_lower = after_placeholder.lower()
+    if not after_placeholder_lower.startswith("contains:"):
+        return None
+    
+    # Find the position of "contains:" in the original string (case-insensitive)
+    # We know it starts at position 0 after trimming, so find the length
+    contains_len = len("contains:")
+    # Remove "contains:" prefix and trim (use the actual substring from original)
+    after_contains = after_placeholder[contains_len:].strip()
+    if not after_contains:
+        return None
+    
+    # Expect quoted string
+    if not after_contains.startswith('"') or not after_contains.endswith('"'):
+        return None
+    
+    if len(after_contains) < 2:
+        return None
+    
+    # Extract substring from quotes
+    substring = after_contains[1:-1].strip()
+    
+    return {
+        "column_name": column_name,
+        "substring": substring
+    }
+
+
 def _parse_ai_task(task_name: str) -> Optional[Dict[str, Any]]:
     """
-    Parse 'AI - <InputSheet> | <OutputSheet> | <OutputColumn> | <ModelName> | """<PromptText>"""' pattern.
+    Parse AI task pattern with optional WHEN condition.
+    
+    Supports two formats:
+    1. Unconditional: 'AI - <InputSheet> | <OutputSheet> | <OutputColumn> | <ModelName> | """<PromptText>"""'
+    2. Conditional: 'AI - <InputSheet> | <OutputSheet> | <OutputColumn> | <ModelName> | WHEN {ColumnName} contains: "Text" | """<PromptText>"""'
     
     Syntax examples:
-        Example 1:
+        Example 1 (unconditional):
             AI - URLs output | URLs output | GPT_Company_Summary | gpt-mini | """
             Summarize what this company does in one sentence.
             
@@ -470,19 +538,20 @@ def _parse_ai_task(task_name: str) -> Optional[Dict[str, Any]]:
             Return a single plain-English sentence with no fluff.
             """
         
-        Example 2:
-            AI - Contacts output | Contacts output | GPT_Persona | gpt-4o-mini | """
-            Based on this person's role, determine their functional persona.
+        Example 2 (conditional):
+            AI - URLs output | URLs output | GPT_Company_Summary | gpt-mini | WHEN {Segment} contains: "B2B" | """
+            Summarize what this company does in one sentence.
             
-            Full Name: {Full Name}
-            Title: {Title}
-            Company Summary: {Company Summary}
+            Company: {Company}
+            Website: {Website}
+            Short description: {Short Description}
             
-            Return a 2-4 word persona label (e.g., 'Product Leader', 'IT Security Exec').
+            Return a single plain-English sentence with no fluff.
             """
     
     Returns:
-        Dict with 'input_sheet_name', 'output_sheet_name', 'output_column_name', 'model_name', and 'prompt_template' keys,
+        Dict with 'input_sheet_name', 'output_sheet_name', 'output_column_name', 'model_name', 'prompt_template',
+        and optionally 'condition' (None if unconditional, or dict with 'column_name' and 'substring' if conditional),
         or None if parse fails
     """
     # Check if task name starts with "AI -" (case-insensitive)
@@ -517,8 +586,8 @@ def _parse_ai_task(task_name: str) -> Optional[Dict[str, Any]]:
     # Split before_prompt on |
     tokens_before = [token.strip() for token in before_prompt.split("|")]
     
-    # We expect exactly 4 tokens before the prompt: input_sheet, output_sheet, output_column, model_name
-    if len(tokens_before) != 4:
+    # We expect either 4 tokens (unconditional) or 5 tokens (conditional) before the prompt
+    if len(tokens_before) not in (4, 5):
         return None
     
     input_sheet_name = tokens_before[0]
@@ -530,19 +599,33 @@ def _parse_ai_task(task_name: str) -> Optional[Dict[str, Any]]:
     if not input_sheet_name or not output_sheet_name or not output_column_name or not model_name:
         return None
     
+    # Parse condition if present (5 tokens = conditional)
+    condition = None
+    if len(tokens_before) == 5:
+        condition_segment = tokens_before[4]
+        condition = _parse_ai_condition(condition_segment)
+        if condition is None:
+            return None  # Invalid condition syntax
+    
     # Extract prompt template by removing outer triple quotes
     if not prompt_with_quotes.startswith('"""') or not prompt_with_quotes.endswith('"""'):
         return None
     
     prompt_template = prompt_with_quotes[3:-3]  # Remove first and last 3 characters (""")
     
-    return {
+    result = {
         "input_sheet_name": input_sheet_name,
         "output_sheet_name": output_sheet_name,
         "output_column_name": output_column_name,
         "model_name": model_name,
         "prompt_template": prompt_template
     }
+    
+    # Add condition if present
+    if condition is not None:
+        result["condition"] = condition
+    
+    return result
 
 
 def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Optional[str]:
@@ -616,6 +699,7 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         output_column_name = params.get("output_column_name")
         model_name = params.get("model_name")
         prompt_template = params.get("prompt_template")
+        condition = params.get("condition")
         
         # Validate that all required fields are non-empty
         if not input_sheet_name:
@@ -628,6 +712,14 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
             return f"Row {row_index}: AI task model_name is required"
         if prompt_template is None:
             return f"Row {row_index}: AI task prompt_template is required"
+        
+        # Validate condition if present
+        if condition is not None:
+            condition_column_name = condition.get("column_name")
+            if not condition_column_name:
+                return f"Row {row_index}: AI task condition column_name is required when condition is present"
+            # Note: We don't validate that the column exists at parse time,
+            # since sheet headers are validated at runtime when data is present
         
         # Input sheet must exist in inputs or work (we'll check at runtime if it's in work)
         # Output sheet should be an output sheet (but we allow any sheet that exists)
@@ -1454,13 +1546,14 @@ async def run_ai_task(
     semaphore: asyncio.Semaphore
 ) -> None:
     """
-    Execute an AI recipe task.
+    Execute an AI recipe task with optional conditional execution.
     
     This function:
     1. Reads input sheet data
-    2. Builds prompts for each row by substituting {ColumnName} placeholders
-    3. Calls AI API with batching, concurrency limits, and retries
-    4. Writes results to output column in output sheet
+    2. For each row, evaluates condition if present (skips row if condition is false)
+    3. Builds prompts for eligible rows by substituting {ColumnName} placeholders
+    4. Calls AI API with batching, concurrency limits, and retries
+    5. Writes results to output column in output sheet
     
     Args:
         work: Dictionary mapping sheet names to their row lists (mutated)
@@ -1470,6 +1563,7 @@ async def run_ai_task(
             - output_column_name: Name of column to write results to
             - model_name: Model name (will be mapped to OpenRouter identifier)
             - prompt_template: Prompt template with {ColumnName} placeholders
+            - condition: Optional dict with 'column_name' and 'substring' for conditional execution
         ai_client: AsyncOpenAI client configured for OpenRouter
         semaphore: Semaphore to limit concurrent AI requests
         
@@ -1481,6 +1575,7 @@ async def run_ai_task(
     output_column_name = task.params["output_column_name"]
     model_name = task.params["model_name"]
     prompt_template = task.params["prompt_template"]
+    condition = task.params.get("condition")  # Optional condition
     
     # Resolve sheets
     input_rows = work.get(input_sheet_name)
@@ -1511,10 +1606,42 @@ async def run_ai_task(
     if len(input_rows) > 0:
         column_headers = set(input_rows[0].keys())
     
+    # Helper function to evaluate condition for a row
+    def evaluate_condition(row: Dict[str, Any]) -> bool:
+        """
+        Evaluate the condition for a row.
+        
+        Returns:
+            True if condition is None (unconditional) or if condition evaluates to True.
+            False if condition evaluates to False.
+        """
+        if condition is None:
+            return True  # Unconditional: process all rows
+        
+        # Get condition column value
+        condition_column_name = condition["column_name"]
+        condition_substring = condition["substring"]
+        
+        # Get value from row (stringified, trimmed)
+        row_value = row.get(condition_column_name)
+        if row_value is None:
+            row_value = ""
+        else:
+            row_value = str(row_value).strip()
+        
+        # Case-insensitive contains check
+        return condition_substring.lower() in row_value.lower()
+    
     # Build prompts for each row
     async def process_row(row_index: int, row: Dict[str, Any]) -> None:
-        """Process a single row: build prompt, call AI, write result."""
+        """Process a single row: check condition, build prompt, call AI, write result."""
         try:
+            # Evaluate condition first - if false, skip this row entirely
+            if not evaluate_condition(row):
+                # Condition is false: skip this row, leave output cell unchanged
+                return
+            
+            # Condition is true (or no condition): proceed with AI processing
             # Build row values dict (column name -> value)
             row_values = {}
             for col_name in column_headers:
@@ -1556,6 +1683,7 @@ async def run_ai_task(
     
     # Process all rows concurrently (with semaphore limiting concurrency)
     # Batch processing: process in chunks to avoid overwhelming the system
+    # Note: Rows that don't pass the condition will be skipped in process_row
     batch_size = 50
     for batch_start in range(0, len(input_rows), batch_size):
         batch_end = min(batch_start + batch_size, len(input_rows))
