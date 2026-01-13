@@ -10,9 +10,16 @@ All Supabase and Google Sheets I/O is handled by the caller.
 """
 
 import re
+import asyncio
+import os
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional, Callable
 from urllib.parse import urlparse
+from openai import AsyncOpenAI
+from dotenv import load_dotenv
+
+# Load environment variables for AI client
+load_dotenv()
 
 
 # Task type constants
@@ -29,6 +36,7 @@ TASK_REMOVE_CHARACTERS = "REMOVE_CHARACTERS"
 TASK_CONCATENATE = "CONCATENATE"
 TASK_MAP = "MAP"
 TASK_ASSIGN_OTHER = "ASSIGN_OTHER"
+TASK_AI = "AI"
 
 # Input sheet names (read-only)
 INPUT_SHEETS = {"URLs", "Contacts", "Master"}
@@ -446,6 +454,97 @@ def _parse_assign_other(task_name: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _parse_ai_task(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'AI - <InputSheet> | <OutputSheet> | <OutputColumn> | <ModelName> | """<PromptText>"""' pattern.
+    
+    Syntax examples:
+        Example 1:
+            AI - URLs output | URLs output | GPT_Company_Summary | gpt-mini | """
+            Summarize what this company does in one sentence.
+            
+            Company: {Company}
+            Website: {Website}
+            Short description: {Short Description}
+            
+            Return a single plain-English sentence with no fluff.
+            """
+        
+        Example 2:
+            AI - Contacts output | Contacts output | GPT_Persona | gpt-4o-mini | """
+            Based on this person's role, determine their functional persona.
+            
+            Full Name: {Full Name}
+            Title: {Title}
+            Company Summary: {Company Summary}
+            
+            Return a 2-4 word persona label (e.g., 'Product Leader', 'IT Security Exec').
+            """
+    
+    Returns:
+        Dict with 'input_sheet_name', 'output_sheet_name', 'output_column_name', 'model_name', and 'prompt_template' keys,
+        or None if parse fails
+    """
+    # Check if task name starts with "AI -" (case-insensitive)
+    if not task_name.lower().startswith("ai -"):
+        return None
+    
+    # Remove the prefix and trim
+    prefix_len = len("AI -")
+    rest = task_name[prefix_len:].strip()
+    
+    if not rest:
+        return None
+    
+    # Split by pipe character - but we need to be careful because the prompt may contain pipes
+    # The prompt is wrapped in triple quotes, so we can find the last token by looking for triple quotes
+    # Strategy: split on |, but the last token should contain the prompt with triple quotes
+    
+    # Find the position of the first triple quote
+    first_triple_quote = rest.find('"""')
+    if first_triple_quote == -1:
+        return None  # No triple quotes found
+    
+    # Find the position of the last triple quote (must be after the first one)
+    last_triple_quote = rest.rfind('"""')
+    if last_triple_quote == -1 or last_triple_quote <= first_triple_quote:
+        return None  # Invalid triple quote structure
+    
+    # Split the part before the prompt on |
+    before_prompt = rest[:first_triple_quote].strip()
+    prompt_with_quotes = rest[first_triple_quote:last_triple_quote + 3].strip()
+    
+    # Split before_prompt on |
+    tokens_before = [token.strip() for token in before_prompt.split("|")]
+    
+    # We expect exactly 4 tokens before the prompt: input_sheet, output_sheet, output_column, model_name
+    if len(tokens_before) != 4:
+        return None
+    
+    input_sheet_name = tokens_before[0]
+    output_sheet_name = tokens_before[1]
+    output_column_name = tokens_before[2]
+    model_name = tokens_before[3]
+    
+    # Validate that none are empty
+    if not input_sheet_name or not output_sheet_name or not output_column_name or not model_name:
+        return None
+    
+    # Extract prompt template by removing outer triple quotes
+    if not prompt_with_quotes.startswith('"""') or not prompt_with_quotes.endswith('"""'):
+        return None
+    
+    prompt_template = prompt_with_quotes[3:-3]  # Remove first and last 3 characters (""")
+    
+    return {
+        "input_sheet_name": input_sheet_name,
+        "output_sheet_name": output_sheet_name,
+        "output_column_name": output_column_name,
+        "model_name": model_name,
+        "prompt_template": prompt_template
+    }
+
+
 def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Optional[str]:
     """
     Validate a parsed task according to the rules.
@@ -510,6 +609,29 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         # Sheet must be an output sheet
         if sheet_name not in OUTPUT_SHEETS:
             return f"Row {row_index}: Operation on '{sheet_name}' is not allowed. Only output sheets (URLs output, Contacts output) can be used for non-copy operations"
+    
+    elif task_type == TASK_AI:
+        input_sheet_name = params.get("input_sheet_name")
+        output_sheet_name = params.get("output_sheet_name")
+        output_column_name = params.get("output_column_name")
+        model_name = params.get("model_name")
+        prompt_template = params.get("prompt_template")
+        
+        # Validate that all required fields are non-empty
+        if not input_sheet_name:
+            return f"Row {row_index}: AI task input_sheet_name is required"
+        if not output_sheet_name:
+            return f"Row {row_index}: AI task output_sheet_name is required"
+        if not output_column_name:
+            return f"Row {row_index}: AI task output_column_name is required"
+        if not model_name:
+            return f"Row {row_index}: AI task model_name is required"
+        if prompt_template is None:
+            return f"Row {row_index}: AI task prompt_template is required"
+        
+        # Input sheet must exist in inputs or work (we'll check at runtime if it's in work)
+        # Output sheet should be an output sheet (but we allow any sheet that exists)
+        # For now, we just validate they're non-empty strings
     
     return None
 
@@ -616,6 +738,11 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             parsed = _parse_assign_other(task_name)
             if parsed:
                 task_type = TASK_ASSIGN_OTHER
+                params = parsed
+        elif task_name.lower().startswith("ai -"):
+            parsed = _parse_ai_task(task_name)
+            if parsed:
+                task_type = TASK_AI
                 params = parsed
         
         # Check if parsing succeeded
@@ -1227,6 +1354,224 @@ def map_task(work: Dict[str, List[Dict[str, Any]]],
         # Else: row[target_output_column] remains unchanged (or becomes undefined if not set before)
 
 
+def _map_model_name(model_name: str) -> str:
+    """
+    Map user-friendly model names to OpenRouter model identifiers.
+    
+    Args:
+        model_name: User-friendly model name (e.g., "gpt-mini", "gpt-4o-mini", "claude-haiku")
+                   or an OpenRouter model identifier (e.g., "openai/gpt-4o-mini")
+        
+    Returns:
+        OpenRouter model identifier string
+        
+    Raises:
+        ValueError: If model_name is not recognized and doesn't look like an OpenRouter identifier
+    """
+    model_mapping = {
+        "gpt-mini": "openai/gpt-4o-mini",
+        "gpt-4o-mini": "openai/gpt-4o-mini",
+        "gpt-4o": "openai/gpt-4o",
+        "gpt-4": "openai/gpt-4-turbo",
+        "claude-haiku": "anthropic/claude-3-haiku",
+        "claude-sonnet": "anthropic/claude-3.5-sonnet",
+        "claude-opus": "anthropic/claude-3-opus",
+        "gemini-flash": "google/gemini-2.0-flash-exp",
+        "gemini-pro": "google/gemini-pro",
+    }
+    
+    model_name_lower = model_name.lower().strip()
+    if model_name_lower in model_mapping:
+        return model_mapping[model_name_lower]
+    
+    # If not found, check if it looks like an OpenRouter model identifier (contains /)
+    # Common patterns: "openai/...", "anthropic/...", "google/..."
+    if "/" in model_name:
+        # Assume it's already an OpenRouter identifier
+        return model_name
+    
+    # Unknown model name - raise error
+    raise ValueError(
+        f"Unknown model name '{model_name}'. "
+        f"Supported models: {', '.join(sorted(model_mapping.keys()))}, "
+        f"or use OpenRouter format (e.g., 'openai/gpt-4o-mini')"
+    )
+
+
+async def _call_ai_with_retry(
+    client: AsyncOpenAI,
+    prompt: str,
+    model: str,
+    max_retries: int = 3,
+    backoff_delays: List[float] = None
+) -> Optional[str]:
+    """
+    Call AI model with retry logic and exponential backoff.
+    
+    Args:
+        client: AsyncOpenAI client (configured for OpenRouter)
+        prompt: The prompt text to send
+        model: Model identifier
+        max_retries: Maximum number of retry attempts
+        backoff_delays: List of delay seconds for each retry (default: [1, 2])
+        
+    Returns:
+        Response text or None if all attempts fail
+    """
+    if backoff_delays is None:
+        backoff_delays = [1, 2]
+    
+    for attempt in range(max_retries):
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=500,  # Reasonable default for recipe tasks
+                temperature=0.3
+            )
+            
+            if response and response.choices and len(response.choices) > 0:
+                result = response.choices[0].message.content.strip()
+                return result
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+                await asyncio.sleep(delay)
+            else:
+                # Last attempt failed
+                return None
+    
+    return None
+
+
+async def run_ai_task(
+    work: Dict[str, List[Dict[str, Any]]],
+    task: RecipeTask,
+    ai_client: AsyncOpenAI,
+    semaphore: asyncio.Semaphore
+) -> None:
+    """
+    Execute an AI recipe task.
+    
+    This function:
+    1. Reads input sheet data
+    2. Builds prompts for each row by substituting {ColumnName} placeholders
+    3. Calls AI API with batching, concurrency limits, and retries
+    4. Writes results to output column in output sheet
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        task: RecipeTask with type TASK_AI and params containing:
+            - input_sheet_name: Name of input sheet
+            - output_sheet_name: Name of output sheet
+            - output_column_name: Name of column to write results to
+            - model_name: Model name (will be mapped to OpenRouter identifier)
+            - prompt_template: Prompt template with {ColumnName} placeholders
+        ai_client: AsyncOpenAI client configured for OpenRouter
+        semaphore: Semaphore to limit concurrent AI requests
+        
+    Raises:
+        ValueError: If input sheet is not found or other configuration errors
+    """
+    input_sheet_name = task.params["input_sheet_name"]
+    output_sheet_name = task.params["output_sheet_name"]
+    output_column_name = task.params["output_column_name"]
+    model_name = task.params["model_name"]
+    prompt_template = task.params["prompt_template"]
+    
+    # Resolve sheets
+    input_rows = work.get(input_sheet_name)
+    if input_rows is None:
+        raise ValueError(f"Input sheet '{input_sheet_name}' not found in work dictionary")
+    
+    output_rows = work.get(output_sheet_name)
+    if output_rows is None:
+        raise ValueError(f"Output sheet '{output_sheet_name}' not found in work dictionary")
+    
+    # Ensure row alignment: if input and output are different sheets,
+    # we assume they have the same row ordering (row i in input corresponds to row i in output)
+    # If they're the same sheet, they refer to the same list
+    if input_sheet_name == output_sheet_name:
+        output_rows = input_rows
+    else:
+        # Ensure output_rows has at least as many rows as input_rows
+        # If output has fewer rows, extend it with empty dicts
+        while len(output_rows) < len(input_rows):
+            output_rows.append({})
+    
+    # Map model name to OpenRouter identifier
+    mapped_model = _map_model_name(model_name)
+    
+    # Determine column headers from first row (if available)
+    # We'll use all keys in the row as potential column names
+    column_headers = set()
+    if len(input_rows) > 0:
+        column_headers = set(input_rows[0].keys())
+    
+    # Build prompts for each row
+    async def process_row(row_index: int, row: Dict[str, Any]) -> None:
+        """Process a single row: build prompt, call AI, write result."""
+        try:
+            # Build row values dict (column name -> value)
+            row_values = {}
+            for col_name in column_headers:
+                value = row.get(col_name)
+                # Convert to string, handling None/empty
+                row_values[col_name] = str(value) if value is not None else ""
+            
+            # Substitute placeholders in prompt template
+            # Pattern: {ColumnName} where ColumnName matches a column header exactly
+            # If a column is referenced but doesn't exist, substitute empty string
+            prompt = prompt_template
+            
+            # Find all placeholders in the prompt (pattern: {ColumnName})
+            placeholder_pattern = r'\{([^}]+)\}'
+            placeholders = re.findall(placeholder_pattern, prompt)
+            
+            # Replace each placeholder with the corresponding value (or empty string if not found)
+            for placeholder_name in placeholders:
+                value = row_values.get(placeholder_name, "")
+                prompt = prompt.replace(f"{{{placeholder_name}}}", value)
+            
+            # Call AI with semaphore for concurrency control
+            async with semaphore:
+                ai_response = await _call_ai_with_retry(ai_client, prompt, mapped_model)
+            
+            # Write result to output column
+            # Ensure the output column exists in the row dict
+            # If AI call failed, write empty string (per spec: empty string on failure)
+            if ai_response is None:
+                output_rows[row_index][output_column_name] = ""
+            else:
+                output_rows[row_index][output_column_name] = ai_response
+        except Exception as e:
+            # Per-row error: write empty string and continue processing other rows
+            # This ensures one row failure doesn't crash the entire task
+            output_rows[row_index][output_column_name] = ""
+            # Note: We don't log here since we don't have a logger in this context
+            # The caller can handle logging if needed
+    
+    # Process all rows concurrently (with semaphore limiting concurrency)
+    # Batch processing: process in chunks to avoid overwhelming the system
+    batch_size = 50
+    for batch_start in range(0, len(input_rows), batch_size):
+        batch_end = min(batch_start + batch_size, len(input_rows))
+        batch_rows = input_rows[batch_start:batch_end]
+        
+        # Process batch concurrently
+        tasks = [
+            process_row(batch_start + i, row)
+            for i, row in enumerate(batch_rows)
+        ]
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Note: We continue even if some rows fail (exceptions are caught by gather)
+
+
 def run_recipe(project_id: str,
                run_id: str,
                urls_rows: List[Dict[str, Any]],
@@ -1281,6 +1626,35 @@ def run_recipe(project_id: str,
     
     # Execute tasks in order
     master_status_updates = []
+    
+    # Initialize AI client and semaphore (only if we have AI tasks)
+    ai_client = None
+    ai_semaphore = None
+    has_ai_tasks = any(task.type == TASK_AI for task in tasks)
+    
+    if has_ai_tasks:
+        # Initialize OpenRouter client (same pattern as enrich_workflow)
+        openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+        if not openrouter_api_key:
+            return {
+                "ok": False,
+                "errors": ["OPENROUTER_API_KEY environment variable is required for AI tasks"],
+                "urls_output": None,
+                "contacts_output": None,
+                "master_status_updates": None,
+            }
+        
+        ai_client = AsyncOpenAI(
+            api_key=openrouter_api_key,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={
+                "HTTP-Referer": "https://example.com",
+                "X-Title": "RecipeWorkflow"
+            }
+        )
+        
+        # Create semaphore for concurrency control (5 concurrent requests, same as enrichment)
+        ai_semaphore = asyncio.Semaphore(5)
     
     try:
         for task in tasks:
@@ -1381,6 +1755,15 @@ def run_recipe(project_id: str,
                     task.params["group_column"],
                     task.params["mappings"]
                 )
+            elif task.type == TASK_AI:
+                # AI tasks are async, so we need to run them in an event loop
+                # Since run_recipe is sync, we use asyncio.run()
+                # Note: asyncio.run() creates a new event loop, so this is safe even if
+                # called from a sync context (which is the case in worker.py)
+                try:
+                    asyncio.run(run_ai_task(work, task, ai_client, ai_semaphore))
+                except Exception as e:
+                    raise ValueError(f"AI task failed on row {task.row_index}: {str(e)}")
             else:
                 raise ValueError(f"Unknown task type: {task.type}")
             
