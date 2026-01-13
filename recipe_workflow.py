@@ -38,6 +38,7 @@ TASK_REMOVE_TEXT = "REMOVE_TEXT"
 TASK_CONCATENATE = "CONCATENATE"
 TASK_MAP = "MAP"
 TASK_ASSIGN_OTHER = "ASSIGN_OTHER"
+TASK_COPY_BY_KEY = "COPY_BY_KEY"
 TASK_AI = "AI"
 TASK_EXA = "EXA"
 
@@ -521,6 +522,52 @@ def _parse_assign_other(task_name: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _parse_copy_by_key(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Copy by key - <SourceSheet> | <SourceKeyColumn> | <TargetSheet> | <TargetKeyColumn>' pattern.
+    
+    Syntax examples:
+        Copy by key - URLs output | Website | Contacts output | Website
+        Copy by key - Accounts output | Domain | Leads output | WebsiteDomain
+    
+    Returns:
+        Dict with 'source_sheet_name', 'source_key_column', 'target_sheet_name', and 'target_key_column' keys, or None if parse fails
+    """
+    # Check if task name starts with "Copy by key -" (case-insensitive)
+    if not task_name.lower().startswith("copy by key -"):
+        return None
+    
+    # Remove the prefix and trim
+    prefix_len = len("Copy by key -")
+    rest = task_name[prefix_len:].strip()
+    
+    if not rest:
+        return None
+    
+    # Split by pipe character
+    tokens = [token.strip() for token in rest.split("|")]
+    
+    # Must have exactly 4 tokens
+    if len(tokens) != 4:
+        return None
+    
+    source_sheet_name = tokens[0]
+    source_key_column = tokens[1]
+    target_sheet_name = tokens[2]
+    target_key_column = tokens[3]
+    
+    # Validate that all tokens are non-empty
+    if not source_sheet_name or not source_key_column or not target_sheet_name or not target_key_column:
+        return None
+    
+    return {
+        "source_sheet_name": source_sheet_name,
+        "source_key_column": source_key_column,
+        "target_sheet_name": target_sheet_name,
+        "target_key_column": target_key_column
+    }
+
+
 def _parse_exa_condition(condition_segment: str) -> Optional[Dict[str, str]]:
     """
     Parse a WHEN condition segment: 'WHEN {ColumnName} is not empty'
@@ -898,6 +945,29 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         if sheet_name not in OUTPUT_SHEETS:
             return f"Row {row_index}: Operation on '{sheet_name}' is not allowed. Only output sheets (URLs output, Contacts output) can be used for non-copy operations"
     
+    elif task_type == TASK_COPY_BY_KEY:
+        source_sheet_name = params.get("source_sheet_name")
+        source_key_column = params.get("source_key_column")
+        target_sheet_name = params.get("target_sheet_name")
+        target_key_column = params.get("target_key_column")
+        
+        # Validate that all required fields are non-empty
+        if not source_sheet_name:
+            return f"Row {row_index}: Copy by key task source_sheet_name is required"
+        if not source_key_column:
+            return f"Row {row_index}: Copy by key task source_key_column is required"
+        if not target_sheet_name:
+            return f"Row {row_index}: Copy by key task target_sheet_name is required"
+        if not target_key_column:
+            return f"Row {row_index}: Copy by key task target_key_column is required"
+        
+        # Both sheets must be output sheets (similar to Map task)
+        if source_sheet_name not in OUTPUT_SHEETS:
+            return f"Row {row_index}: Source sheet '{source_sheet_name}' must be an output sheet (URLs output or Contacts output)"
+        
+        if target_sheet_name not in OUTPUT_SHEETS:
+            return f"Row {row_index}: Target sheet '{target_sheet_name}' must be an output sheet (URLs output or Contacts output)"
+    
     elif task_type == TASK_AI:
         input_sheet_name = params.get("input_sheet_name")
         output_sheet_name = params.get("output_sheet_name")
@@ -1062,6 +1132,11 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             parsed = _parse_assign_other(task_name)
             if parsed:
                 task_type = TASK_ASSIGN_OTHER
+                params = parsed
+        elif task_name.lower().startswith("copy by key"):
+            parsed = _parse_copy_by_key(task_name)
+            if parsed:
+                task_type = TASK_COPY_BY_KEY
                 params = parsed
         elif task_name.lower().startswith("ai -"):
             parsed = _parse_ai_task(task_name)
@@ -1765,6 +1840,133 @@ def map_task(work: Dict[str, List[Dict[str, Any]]],
         # Else: row[target_output_column] remains unchanged (or becomes undefined if not set before)
 
 
+def copy_by_key_task(work: Dict[str, List[Dict[str, Any]]],
+                     source_sheet_name: str,
+                     source_key_column: str,
+                     target_sheet_name: str,
+                     target_key_column: str) -> None:
+    """
+    Copy all non-key columns from source sheet to target sheet, matching rows by key columns.
+    
+    For each row in the target sheet:
+    - Look up the value of target_key_column
+    - Use that to find the matching row in the source sheet by source_key_column
+    - For every non-key column in the source sheet:
+      - Create that column on the target sheet if it doesn't exist
+      - Copy the source cell value into the target row's column
+    - Rows with no matching key in the source sheet are left unchanged
+    
+    Example:
+        Copy by key - URLs output | Website | Contacts output | Website
+        - For each row in "Contacts output":
+          - Use Website as the key
+          - Look up the row in "URLs output" with the same Website
+          - Copy all columns except Website (Segment, Employee Count, Tech Stack, etc.)
+          - Create any missing columns in "Contacts output"
+          - Overwrite values in those columns with the source row values
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        source_sheet_name: Name of source sheet in work
+        source_key_column: Column name in source sheet to use as lookup key
+        target_sheet_name: Name of target sheet in work
+        target_key_column: Column name in target sheet to use as lookup key
+        
+    Raises:
+        ValueError: If source or target sheet is not found, or if required columns are missing
+    """
+    # Step 1: Fetch source and target sheet data
+    source_rows = work.get(source_sheet_name)
+    target_rows = work.get(target_sheet_name)
+    
+    if source_rows is None:
+        raise ValueError(f"Source sheet '{source_sheet_name}' not found")
+    
+    if target_rows is None:
+        raise ValueError(f"Target sheet '{target_sheet_name}' not found")
+    
+    # Step 2: Check required columns exist
+    # Check if source_key_column exists in source sheet
+    if len(source_rows) > 0:
+        source_key_exists = any(source_key_column in row for row in source_rows)
+        if not source_key_exists:
+            raise ValueError(f"Source key column '{source_key_column}' not found in sheet '{source_sheet_name}'")
+    
+    # Check if target_key_column exists in target sheet
+    if len(target_rows) > 0:
+        target_key_exists = any(target_key_column in row for row in target_rows)
+        if not target_key_exists:
+            raise ValueError(f"Target key column '{target_key_column}' not found in sheet '{target_sheet_name}'")
+    
+    # Step 3: Build source lookup dictionary
+    # key -> source_row (first occurrence wins if duplicates)
+    source_lookup: Dict[str, Dict[str, Any]] = {}
+    
+    for row in source_rows:
+        # Get key value and normalize: String(value).trim()
+        key_raw = row.get(source_key_column)
+        if key_raw is None:
+            continue
+        
+        key = str(key_raw).strip()
+        
+        # Skip rows with empty key (after trimming)
+        if not key:
+            continue
+        
+        # Only add if we haven't seen this key before (first occurrence wins)
+        if key not in source_lookup:
+            source_lookup[key] = row
+    
+    # Step 4: Determine which columns to copy
+    # All columns in source sheet EXCEPT source_key_column
+    source_data_columns = set()
+    if len(source_rows) > 0:
+        # Get all column names from the first source row
+        for col_name in source_rows[0].keys():
+            if col_name != source_key_column:
+                source_data_columns.add(col_name)
+    
+    # Step 5: Ensure target has all columns
+    # For each source data column, add it to all target rows if it doesn't exist
+    for col_name in source_data_columns:
+        for row in target_rows:
+            if col_name not in row:
+                row[col_name] = ""
+    
+    # Step 6: Apply the mapping
+    for row in target_rows:
+        # Get target key value and normalize: String(value).trim()
+        target_key_raw = row.get(target_key_column)
+        if target_key_raw is None:
+            continue
+        
+        target_key = str(target_key_raw).strip()
+        
+        # Skip rows with empty target key (after trimming)
+        if not target_key:
+            continue
+        
+        # Look up source row
+        source_row = source_lookup.get(target_key)
+        
+        # If no source match, skip this row (leave values unchanged)
+        if source_row is None:
+            continue
+        
+        # If found, copy all source data columns to target row
+        for col_name in source_data_columns:
+            # Get value from source row (can be None, empty, or any value)
+            source_value = source_row.get(col_name)
+            
+            # Copy to target row (overwrite existing value)
+            # If source_value is None, we'll set it to empty string for consistency
+            if source_value is None:
+                row[col_name] = ""
+            else:
+                row[col_name] = source_value
+
+
 def _map_model_name(model_name: str) -> str:
     """
     Map user-friendly model names to OpenRouter model identifiers.
@@ -2449,6 +2651,14 @@ def run_recipe(project_id: str,
                     task.params["sheet_name"],
                     task.params["group_column"],
                     task.params["mappings"]
+                )
+            elif task.type == TASK_COPY_BY_KEY:
+                copy_by_key_task(
+                    work,
+                    task.params["source_sheet_name"],
+                    task.params["source_key_column"],
+                    task.params["target_sheet_name"],
+                    task.params["target_key_column"]
                 )
             elif task.type == TASK_AI:
                 # AI tasks are async, so we need to run them in an event loop
