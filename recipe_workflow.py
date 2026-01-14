@@ -41,6 +41,7 @@ TASK_MAP = "MAP"
 TASK_ASSIGN_OTHER = "ASSIGN_OTHER"
 TASK_COPY_BY_KEY = "COPY_BY_KEY"
 TASK_INSERT_COLUMN = "INSERT_COLUMN"
+TASK_COPY_COLUMNS = "COPY_COLUMNS"
 TASK_AI = "AI"
 TASK_EXA = "EXA"
 
@@ -630,6 +631,81 @@ def _parse_insert_column(task_name: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _parse_copy_columns(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Copy columns - (SourceSheet, TargetSheet, SourceCol1:TargetCol1 | SourceCol2:TargetCol2 | ...)' pattern.
+    
+    Syntax examples:
+        Copy columns - (Contacts, Contacts output, Email:Email)
+        Copy columns - (Contacts, Contacts output, First Name:First Name | Last Name:Last Name | Email:Email)
+        Copy columns - (Acct, URLs output, Account Website:Website | Account Name:Company Name)
+    
+    Returns:
+        Dict with 'source_sheet', 'target_sheet', and 'mappings' keys (mappings is a list of (src_col, tgt_col) tuples),
+        or None if parse fails
+    """
+    # Check if task name starts with "Copy columns -" (case-insensitive)
+    if not task_name.lower().startswith("copy columns -"):
+        return None
+    
+    # Remove the prefix and trim
+    prefix_len = len("Copy columns -")
+    rest = task_name[prefix_len:].strip()
+    
+    if not rest:
+        return None
+    
+    # Pattern: (SourceSheet, TargetSheet, SourceCol1:TargetCol1 | SourceCol2:TargetCol2 | ...)
+    pattern = r'^\(([^,]+),\s*([^,]+),\s*(.+)\)$'
+    match = re.match(pattern, rest, re.IGNORECASE)
+    if not match:
+        return None
+    
+    source_sheet = match.group(1).strip()
+    target_sheet = match.group(2).strip()
+    mappings_str = match.group(3).strip()
+    
+    # Validate that source and target sheets are non-empty
+    if not source_sheet or not target_sheet:
+        return None
+    
+    # Parse the mappings string (pipe-separated list of SourceCol:TargetCol pairs)
+    mappings = []
+    mapping_parts = [part.strip() for part in mappings_str.split("|")]
+    
+    for mapping_part in mapping_parts:
+        if not mapping_part:
+            continue  # Skip empty parts
+        
+        # Each mapping must contain a colon
+        if ":" not in mapping_part:
+            return None  # Malformed mapping
+        
+        # Split by colon (only split on first colon in case column names contain colons)
+        colon_pos = mapping_part.find(":")
+        if colon_pos == -1 or colon_pos == 0 or colon_pos == len(mapping_part) - 1:
+            return None  # Malformed mapping
+        
+        src_col = mapping_part[:colon_pos].strip()
+        tgt_col = mapping_part[colon_pos + 1:].strip()
+        
+        # Both source and target column names must be non-empty
+        if not src_col or not tgt_col:
+            return None
+        
+        mappings.append((src_col, tgt_col))
+    
+    # Must have at least one mapping
+    if not mappings:
+        return None
+    
+    return {
+        "source_sheet": source_sheet,
+        "target_sheet": target_sheet,
+        "mappings": mappings
+    }
+
+
 def _parse_exa_condition(condition_segment: str) -> Optional[Dict[str, str]]:
     """
     Parse a WHEN condition segment: 'WHEN {ColumnName} is not empty'
@@ -1021,6 +1097,19 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         if not column_name:
             return f"Row {row_index}: Insert column task column_name is required"
     
+    elif task_type == TASK_COPY_COLUMNS:
+        source_sheet = params.get("source_sheet")
+        target_sheet = params.get("target_sheet")
+        mappings = params.get("mappings")
+        
+        # Validate that all required fields are non-empty
+        if not source_sheet:
+            return f"Row {row_index}: Copy columns task source_sheet is required"
+        if not target_sheet:
+            return f"Row {row_index}: Copy columns task target_sheet is required"
+        if not mappings or not isinstance(mappings, list) or len(mappings) == 0:
+            return f"Row {row_index}: Copy columns task must have at least one column mapping"
+    
     elif task_type == TASK_AI:
         input_sheet_name = params.get("input_sheet_name")
         output_sheet_name = params.get("output_sheet_name")
@@ -1201,6 +1290,11 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             if parsed:
                 task_type = TASK_INSERT_COLUMN
                 params = parsed
+        elif task_name.lower().startswith("copy columns"):
+            parsed = _parse_copy_columns(task_name)
+            if parsed:
+                task_type = TASK_COPY_COLUMNS
+                params = parsed
         elif task_name.lower().startswith("ai -"):
             parsed = _parse_ai_task(task_name)
             if parsed:
@@ -1288,6 +1382,9 @@ def _extract_referenced_sheets(tasks: List[RecipeTask]) -> set:
             referenced_sheets.add(params.get("target_sheet"))
         elif task.type == TASK_INSERT_COLUMN:
             referenced_sheets.add(params.get("sheet_name"))
+        elif task.type == TASK_COPY_COLUMNS:
+            referenced_sheets.add(params.get("source_sheet"))
+            referenced_sheets.add(params.get("target_sheet"))
         elif task.type == TASK_AI:
             referenced_sheets.add(params.get("input_sheet_name"))
             referenced_sheets.add(params.get("output_sheet_name"))
@@ -2263,6 +2360,76 @@ def insert_column_task(work: Dict[str, List[Dict[str, Any]]],
         return error_msg
 
 
+def copy_columns(work: Dict[str, List[Dict[str, Any]]],
+                 source_sheet: str,
+                 target_sheet: str,
+                 mappings: List[Tuple[str, str]],
+                 errors: List[str]) -> None:
+    """
+    Copy columns from source sheet to target sheet, replacing entire columns.
+    
+    For each mapping (src_col, tgt_col):
+    - Copies all values from src_col in source_sheet to tgt_col in target_sheet
+    - Aligns rows by index (source row 0 → target row 0, etc.)
+    - If target has more rows than source, clears cells beyond source's last row (sets to "")
+    - If target has fewer rows than source, extends target rows to match source length
+    - Completely replaces the target column's data (all rows overwritten)
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        source_sheet: Name of source sheet in work
+        target_sheet: Name of target sheet in work
+        mappings: List of (source_column, target_column) tuples
+        errors: List to append error messages to (mutated)
+    """
+    print(f"[RECIPE][COPY_COLUMNS] Source sheet: {source_sheet}, Target sheet: {target_sheet}")
+    print(f"[RECIPE][COPY_COLUMNS] Mappings: {mappings}")
+    
+    # Check if source and target sheets exist
+    # If either is missing, log error, append to errors, and return WITHOUT mutating work
+    if source_sheet not in work or target_sheet not in work:
+        error_msg = f"[RECIPE][COPY_COLUMNS][ERROR] source_sheet='{source_sheet}' or target_sheet='{target_sheet}' not found; available sheets={list(work.keys())}"
+        print(error_msg)
+        errors.append(error_msg)
+        return  # Do NOT mutate work
+    
+    source_rows = work[source_sheet]
+    target_rows = work[target_sheet]
+    
+    source_len = len(source_rows)
+    target_len = len(target_rows)
+    total_len = max(source_len, target_len)
+    
+    print(f"[RECIPE][COPY_COLUMNS] Source rows: {source_len}, Target rows: {target_len}, Total length: {total_len}")
+    
+    # Ensure target_rows has length total_len (extend if needed)
+    while len(target_rows) < total_len:
+        target_rows.append({})
+    
+    # Process each mapping
+    for src_col, tgt_col in mappings:
+        print(f"[RECIPE][COPY_COLUMNS] Copying '{src_col}' → '{tgt_col}'")
+        
+        # Copy values row by row
+        for i in range(total_len):
+            # Ensure target_rows[i] is a dict
+            if not isinstance(target_rows[i], dict):
+                target_rows[i] = {}
+            
+            # Get value from source (or "" if beyond source length or column missing)
+            if i < source_len:
+                value = source_rows[i].get(src_col, "")
+            else:
+                value = ""  # Clear cells beyond source's last row
+            
+            # Set target column value
+            target_rows[i][tgt_col] = value
+        
+        print(f"[RECIPE][COPY_COLUMNS] Copied '{src_col}' → '{tgt_col}' for {total_len} rows")
+    
+    print(f"[RECIPE][COPY_COLUMNS] Completed copying {len(mappings)} column(s)")
+
+
 def _map_model_name(model_name: str) -> str:
     """
     Map user-friendly model names to OpenRouter model identifiers.
@@ -3031,6 +3198,15 @@ def run_recipe(project_id: str,
                     # Catch any unexpected exceptions and handle gracefully
                     errors.append(f"Row {task.row_index}: Insert column task failed: {str(e)}")
                     continue
+            elif task.type == TASK_COPY_COLUMNS:
+                print(f"[RECIPE][COPY_COLUMNS] Executing task at row {task.row_index}")
+                copy_columns(
+                    work,
+                    task.params["source_sheet"],
+                    task.params["target_sheet"],
+                    task.params["mappings"],
+                    errors
+                )
             elif task.type == TASK_AI:
                 # AI tasks are async, so we need to run them in an event loop
                 # Since run_recipe is sync, we use asyncio.run()
