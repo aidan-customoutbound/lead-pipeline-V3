@@ -287,19 +287,22 @@ def process_run(run_row, supabase):
             # Recipe succeeded - write results to Sheets
             log(f"[worker] Recipe succeeded, writing results to Sheets")
             
-            # Write URLs output
-            urls_output = result.get("urls_output")
-            if urls_output is not None:
-                log(f"[worker] Writing {len(urls_output)} rows to 'URLs output' tab")
-                write_rows_to_tab(service, sheet_id, "URLs output", urls_output)
+            # Write back ALL sheets from work dictionary (except Master)
+            # This ensures any mutated sheets (e.g., DNC URL, DNC Email, Acct, VIP, etc.) are persisted
+            sheets_written = 0
+            for sheet_name, rows in work.items():
+                # Skip Master tab - it has special handling below
+                if sheet_name == "Master":
+                    continue
+                
+                # Write the sheet back to Google Sheets
+                log(f"[worker] Writing {len(rows)} rows to '{sheet_name}' tab")
+                write_rows_to_tab(service, sheet_id, sheet_name, rows)
+                sheets_written += 1
             
-            # Write Contacts output
-            contacts_output = result.get("contacts_output")
-            if contacts_output is not None:
-                log(f"[worker] Writing {len(contacts_output)} rows to 'Contacts output' tab")
-                write_rows_to_tab(service, sheet_id, "Contacts output", contacts_output)
+            log(f"[worker] Wrote back {sheets_written} sheets to Google Sheets")
             
-            # Update Master statuses
+            # Update Master statuses (special handling - don't overwrite entire Master tab)
             master_status_updates = result.get("master_status_updates")
             if master_status_updates:
                 log(f"[worker] Updating {len(master_status_updates)} Master status rows")
