@@ -6,6 +6,7 @@ claims them atomically, and executes the enrichment workflow.
 """
 
 import asyncio
+import builtins
 import os
 import sys
 import time
@@ -150,6 +151,23 @@ def process_run(run_row, supabase):
             log(f"Run {run_id} is no longer active, stopping recipe processing")
             return
         
+        # Create list to capture [RECIPE] debug logs
+        debug_logs = []
+        
+        # Store original print function
+        original_print = builtins.print
+        
+        # Create wrapper that intercepts [RECIPE] prints
+        def print_wrapper(*args, **kwargs):
+            # Convert args to string to check prefix (use sep from kwargs or default space)
+            sep = kwargs.get('sep', ' ')
+            message = sep.join(str(arg) for arg in args)
+            if message.startswith("[RECIPE]"):
+                debug_logs.append(message)
+            else:
+                # Pass through to original print
+                original_print(*args, **kwargs)
+        
         try:
             # Get Google Sheets service
             service = get_sheets_service()
@@ -194,21 +212,31 @@ def process_run(run_row, supabase):
                 except Exception as e:
                     log(f"[recipe] Warning: failed to update Master status for row {row_index}: {e}")
             
-            # Run the recipe workflow
-            log(f"[worker] Running recipe_workflow.run_recipe(...)")
-            result = recipe_workflow.run_recipe(
-                project_id=project_id,
-                run_id=run_id,
-                urls_rows=urls_rows,
-                contacts_rows=contacts_rows,
-                master_rows=master_rows,
-                progress_callback=recipe_progress_callback
-            )
+            # Patch print to capture [RECIPE] logs
+            builtins.print = print_wrapper
+            
+            try:
+                # Run the recipe workflow
+                log(f"[worker] Running recipe_workflow.run_recipe(...)")
+                result = recipe_workflow.run_recipe(
+                    project_id=project_id,
+                    run_id=run_id,
+                    urls_rows=urls_rows,
+                    contacts_rows=contacts_rows,
+                    master_rows=master_rows,
+                    progress_callback=recipe_progress_callback
+                )
+            finally:
+                # Always restore original print
+                builtins.print = original_print
             
             # Check if run is still active after recipe execution
             if not is_run_active(supabase, run_id):
                 log(f"Run {run_id} is no longer active, stopping before writing results")
                 return
+            
+            # Store debug logs in error_message column (regardless of success/failure)
+            debug_logs_text = "\n".join(debug_logs) if debug_logs else ""
             
             # Handle recipe result
             if not result.get("ok", False):
@@ -216,6 +244,14 @@ def process_run(run_row, supabase):
                 errors = result.get("errors", [])
                 error_message = "; ".join(errors) if errors else "Recipe execution failed"
                 error_message = error_message[:500]  # Truncate to first 500 chars
+                
+                # Combine error message with debug logs
+                if debug_logs_text:
+                    combined_message = f"{error_message}\n\n[DEBUG LOGS]\n{debug_logs_text}"
+                    # Truncate combined message if too long (keep error message priority)
+                    if len(combined_message) > 5000:
+                        combined_message = combined_message[:5000]
+                    error_message = combined_message
                 
                 finished_at = datetime.utcnow()
                 supabase.table("runs").update({
@@ -253,16 +289,24 @@ def process_run(run_row, supabase):
                 log(f"Run {run_id} is no longer active, stopping before marking completed")
                 return
             
-            # Mark run as completed
+            # Mark run as completed (store debug logs in error_message even on success)
             finished_at = datetime.utcnow()
-            supabase.table("runs").update({
+            update_data = {
                 "status": "completed",
                 "finished_at": finished_at.isoformat()
-            }).eq("id", run_id).eq("status", "running").execute()
+            }
+            if debug_logs_text:
+                # Truncate if too long
+                update_data["error_message"] = debug_logs_text[:5000] if len(debug_logs_text) > 5000 else debug_logs_text
+            
+            supabase.table("runs").update(update_data).eq("id", run_id).eq("status", "running").execute()
             
             log(f"Completed recipe run {run_id} for project {project_id}")
             
         except Exception as e:
+            # Restore original print if exception occurred before finally block
+            builtins.print = original_print
+            
             # Check if run is still active before marking as failed
             if not is_run_active(supabase, run_id):
                 log(f"Run {run_id} is no longer active, stopping before marking failed")
@@ -271,6 +315,15 @@ def process_run(run_row, supabase):
             # Update run to failed (only if still in 'running' status to prevent superseded runs from updating)
             finished_at = datetime.utcnow()
             error_message = str(e)[:500]  # Truncate to first 500 chars
+            
+            # Combine error message with debug logs if available
+            debug_logs_text = "\n".join(debug_logs) if debug_logs else ""
+            if debug_logs_text:
+                combined_message = f"{error_message}\n\n[DEBUG LOGS]\n{debug_logs_text}"
+                # Truncate combined message if too long (keep error message priority)
+                if len(combined_message) > 5000:
+                    combined_message = combined_message[:5000]
+                error_message = combined_message
             
             try:
                 supabase.table("runs").update({
