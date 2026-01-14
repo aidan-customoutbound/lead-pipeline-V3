@@ -48,13 +48,18 @@ def get_sheets_service():
 def get_sheet_id_for_project(project_id: str, supabase_client: Client) -> Optional[str]:
     """
     Fetch sheet_id from prompts table for a given project_id.
+    Falls back to using project_id as sheet_id if not found in prompts table.
+    
+    This fallback is safe for recipe runs where project_id is the Google Sheets
+    spreadsheet ID itself.
     
     Args:
         project_id: Project ID to look up
         supabase_client: Supabase client instance
         
     Returns:
-        sheet_id string if found, None otherwise
+        sheet_id string if found in prompts table, or project_id as fallback.
+        Returns None only if project_id is invalid/empty or on database errors.
     """
     try:
         sheet_id_response = (
@@ -71,9 +76,18 @@ def get_sheet_id_for_project(project_id: str, supabase_client: Client) -> Option
             if sheet_id and sheet_id.strip():
                 return sheet_id.strip()
         
+        # Fallback: use project_id as sheet_id (safe for recipe runs)
+        if project_id and project_id.strip():
+            print(f"  [SHEET EXPORT] No sheet_id found for project_id={project_id}; falling back to using project_id as sheet_id")
+            return project_id.strip()
+        
         return None
     except Exception as e:
         print(f"  [SHEET EXPORT] Error fetching sheet_id for project_id={project_id}: {str(e)}")
+        # On error, still try to fall back to project_id if it's valid
+        if project_id and project_id.strip():
+            print(f"  [SHEET EXPORT] Falling back to using project_id as sheet_id after error")
+            return project_id.strip()
         return None
 
 

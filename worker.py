@@ -157,9 +157,11 @@ def process_run(run_row, supabase):
                 raise ValueError("Could not create Google Sheets service. Check GOOGLE_SA_JSON environment variable.")
             
             # Get sheet_id for this project
+            # This will fall back to project_id if not found in prompts table (safe for recipe runs)
             sheet_id = get_sheet_id_for_project(project_id, supabase)
             if not sheet_id:
-                raise ValueError(f"No sheet_id found for project_id={project_id}")
+                # This should only happen if project_id itself is invalid/empty
+                raise ValueError(f"Invalid project_id: {project_id}")
             
             log(f"[worker] Reading tabs from sheet_id={sheet_id}")
             
