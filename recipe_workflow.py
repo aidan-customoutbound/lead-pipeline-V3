@@ -1375,15 +1375,35 @@ def normalize_urls(work: Dict[str, List[Dict[str, Any]]],
         source_column: Column name containing URLs to normalize
         output_column: Column name to write normalized URLs to
     """
+    rows_before = len(work.get(sheet, []))
+    print(f"[RECIPE][NORMALIZE_URLS] sheet='{sheet}', input_column='{source_column}', output_column='{output_column}', rows_before={rows_before}")
+    
     if sheet not in work:
+        print(f"[RECIPE][NORMALIZE_URLS] WARNING: sheet='{sheet}' not found in work, creating empty sheet")
         work[sheet] = []
     
     rows = work[sheet]
     
+    if not rows:
+        print(f"[RECIPE][NORMALIZE_URLS] sheet='{sheet}' has no rows, returning without modification")
+        return
+    
+    # Check if source column exists in at least one row
+    available_keys = set()
+    for row in rows:
+        available_keys.update(row.keys())
+    
+    if source_column not in available_keys:
+        print(f"[RECIPE][NORMALIZE_URLS] WARNING: input_column='{source_column}' not found in sheet='{sheet}', available_keys={sorted(available_keys)}")
+    
+    rows_processed = 0
     for row in rows:
         url = row.get(source_column)
         normalized = _normalize_url(_safe_str(url))
         row[output_column] = normalized
+        rows_processed += 1
+    
+    print(f"[RECIPE][NORMALIZE_URLS] sheet='{sheet}', rows_processed={rows_processed}, rows_after={len(rows)}")
 
 
 def filter_include(work: Dict[str, List[Dict[str, Any]]],
@@ -2891,6 +2911,7 @@ def run_recipe(project_id: str,
                     task.params["column"]
                 )
             elif task.type == TASK_NORMALIZE_URLS:
+                print(f"[RECIPE][NORMALIZE_URLS] Executing task at row {task.row_index}")
                 normalize_urls(
                     work,
                     task.params["sheet"],
