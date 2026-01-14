@@ -31,6 +31,7 @@ TASK_FILTER_INCLUDE = "FILTER_INCLUDE"
 TASK_FILTER_EXCLUDE = "FILTER_EXCLUDE"
 TASK_FILTER_MATCH = "FILTER_MATCH"
 TASK_FILTER_NOT_MATCH = "FILTER_NOT_MATCH"
+TASK_FILTER_BLANK = "FILTER_BLANK"
 TASK_COUNT_BY = "COUNT_BY"
 TASK_SORT = "SORT"
 TASK_REMOVE_CHARACTERS = "REMOVE_CHARACTERS"
@@ -271,6 +272,24 @@ def _parse_filter_not_match(task_name: str) -> Optional[Dict[str, Any]]:
         "lookup_sheet": lookup_sheet,
         "lookup_column": lookup_column
     }
+
+
+def _parse_filter_blank(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Filter blank - (SheetName, ColumnName)' pattern.
+    
+    Returns:
+        Dict with 'sheet' and 'column' keys, or None if parse fails
+    """
+    pattern = r'^Filter blank\s*-\s*\(([^,]+),\s*([^)]+)\)$'
+    match = re.match(pattern, task_name, re.IGNORECASE)
+    if not match:
+        return None
+    
+    sheet = match.group(1).strip()
+    column = match.group(2).strip()
+    
+    return {"sheet": sheet, "column": column}
 
 
 def _parse_count_by(task_name: str) -> Optional[Dict[str, Any]]:
@@ -935,7 +954,7 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
             return f"Row {row_index}: Copy sheet target cannot be an input sheet, got '{target}'"
     
     elif task_type in (TASK_DEDUPLICATE, TASK_NORMALIZE_URLS, TASK_FILTER_INCLUDE, 
-                       TASK_FILTER_EXCLUDE, TASK_COUNT_BY, TASK_SORT, TASK_REMOVE_CHARACTERS, TASK_CONCATENATE):
+                       TASK_FILTER_EXCLUDE, TASK_FILTER_BLANK, TASK_COUNT_BY, TASK_SORT, TASK_REMOVE_CHARACTERS, TASK_CONCATENATE):
         sheet = params.get("sheet")
         
         # Sheet must be an output sheet
@@ -1155,6 +1174,11 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             if parsed:
                 task_type = TASK_FILTER_NOT_MATCH
                 params = parsed
+        elif task_name.lower().startswith("filter blank"):
+            parsed = _parse_filter_blank(task_name)
+            if parsed:
+                task_type = TASK_FILTER_BLANK
+                params = parsed
         elif task_name.lower().startswith("count by"):
             parsed = _parse_count_by(task_name)
             if parsed:
@@ -1344,6 +1368,35 @@ def filter_exclude(work: Dict[str, List[Dict[str, Any]]],
     
     rows = work[sheet]
     filtered = [row for row in rows if not _safe_contains(row.get(column), text)]
+    work[sheet] = filtered
+
+
+def filter_blank(work: Dict[str, List[Dict[str, Any]]],
+                 sheet: str,
+                 column: str) -> None:
+    """
+    Filter rows to keep only those where column is NOT blank.
+    A "blank" value is defined as None, empty string "", or whitespace-only string.
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        sheet: Name of sheet in work
+        column: Column name to filter on
+    """
+    if sheet not in work:
+        work[sheet] = []
+    
+    rows = work[sheet]
+    filtered = []
+    for row in rows:
+        value = row.get(column)
+        # Check if value is blank: None, empty string, or whitespace-only
+        if value is None:
+            continue  # Skip blank rows
+        value_str = str(value).strip()
+        if value_str:  # Non-empty after strip, keep the row
+            filtered.append(row)
+    
     work[sheet] = filtered
 
 
@@ -2711,6 +2764,12 @@ def run_recipe(project_id: str,
                     task.params["sheet"],
                     task.params["column"],
                     task.params["text"]
+                )
+            elif task.type == TASK_FILTER_BLANK:
+                filter_blank(
+                    work,
+                    task.params["sheet"],
+                    task.params["column"]
                 )
             elif task.type == TASK_FILTER_MATCH:
                 filter_match(
