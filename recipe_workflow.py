@@ -1257,6 +1257,71 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
     return tasks, errors
 
 
+def _extract_referenced_sheets(tasks: List[RecipeTask]) -> set:
+    """
+    Extract all sheet names referenced by tasks.
+    
+    Args:
+        tasks: List of RecipeTask objects
+        
+    Returns:
+        Set of sheet names referenced by any task
+    """
+    referenced_sheets = set()
+    
+    for task in tasks:
+        params = task.params
+        
+        if task.type == TASK_COPY_SHEET:
+            referenced_sheets.add(params.get("source"))
+            referenced_sheets.add(params.get("target"))
+        elif task.type == TASK_DEDUPLICATE:
+            referenced_sheets.add(params.get("sheet"))
+        elif task.type == TASK_NORMALIZE_URLS:
+            referenced_sheets.add(params.get("sheet"))
+        elif task.type == TASK_FILTER_INCLUDE:
+            referenced_sheets.add(params.get("sheet"))
+        elif task.type == TASK_FILTER_EXCLUDE:
+            referenced_sheets.add(params.get("sheet"))
+        elif task.type == TASK_FILTER_BLANK:
+            referenced_sheets.add(params.get("sheet"))
+        elif task.type == TASK_FILTER_MATCH:
+            referenced_sheets.add(params.get("source_sheet"))
+            referenced_sheets.add(params.get("lookup_sheet"))
+        elif task.type == TASK_FILTER_NOT_MATCH:
+            referenced_sheets.add(params.get("source_sheet"))
+            referenced_sheets.add(params.get("lookup_sheet"))
+        elif task.type == TASK_COUNT_BY:
+            referenced_sheets.add(params.get("sheet"))
+        elif task.type == TASK_SORT:
+            referenced_sheets.add(params.get("sheet"))
+        elif task.type == TASK_REMOVE_CHARACTERS:
+            referenced_sheets.add(params.get("sheet"))
+        elif task.type == TASK_REMOVE_TEXT:
+            referenced_sheets.add(params.get("sheet_name"))
+        elif task.type == TASK_CONCATENATE:
+            referenced_sheets.add(params.get("sheet"))
+        elif task.type == TASK_MAP:
+            referenced_sheets.add(params.get("target_sheet"))
+            referenced_sheets.add(params.get("source_sheet"))
+        elif task.type == TASK_ASSIGN_OTHER:
+            referenced_sheets.add(params.get("sheet_name"))
+        elif task.type == TASK_COPY_BY_KEY:
+            referenced_sheets.add(params.get("source_sheet"))
+            referenced_sheets.add(params.get("target_sheet"))
+        elif task.type == TASK_INSERT_COLUMN:
+            referenced_sheets.add(params.get("sheet_name"))
+        elif task.type == TASK_AI:
+            referenced_sheets.add(params.get("input_sheet_name"))
+            referenced_sheets.add(params.get("output_sheet_name"))
+        elif task.type == TASK_EXA:
+            referenced_sheets.add(params.get("sheet_name"))
+    
+    # Remove None values
+    referenced_sheets.discard(None)
+    return referenced_sheets
+
+
 def copy_sheet(inputs: Dict[str, List[Dict[str, Any]]],
                work: Dict[str, List[Dict[str, Any]]],
                source_sheet: str,
@@ -2676,28 +2741,21 @@ async def run_exa_task(
 
 def run_recipe(project_id: str,
                run_id: str,
-               urls_rows: List[Dict[str, Any]],
-               contacts_rows: List[Dict[str, Any]],
-               master_rows: List[Dict[str, Any]],
-               urls_output_rows: Optional[List[Dict[str, Any]]] = None,
-               contacts_output_rows: Optional[List[Dict[str, Any]]] = None,
+               work: Dict[str, List[Dict[str, Any]]],
                progress_callback: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
     """
     Main entry point for the recipe engine.
     
     This function:
-    1. Parses tasks from master_rows
-    2. Executes tasks in order on in-memory data
-    3. Returns results without performing any I/O
+    1. Parses tasks from Master sheet in work dictionary
+    2. Validates that all sheets referenced by tasks exist
+    3. Executes tasks in order on in-memory data
+    4. Returns results without performing any I/O
     
     Args:
         project_id: Project ID (for logging only, not used for I/O)
         run_id: Run ID (for logging only, not used for I/O)
-        urls_rows: Snapshot of URLs sheet rows
-        contacts_rows: Snapshot of Contacts sheet rows
-        master_rows: Snapshot of Master sheet rows
-        urls_output_rows: Optional snapshot of URLs output sheet rows (if tab exists)
-        contacts_output_rows: Optional snapshot of Contacts output sheet rows (if tab exists)
+        work: Dictionary mapping sheet names to their row lists (all sheets from spreadsheet)
         progress_callback: Optional callback function(row_index: int, status: str) called after each task completes
         
     Returns:
@@ -2708,34 +2766,11 @@ def run_recipe(project_id: str,
         - contacts_output: List[Dict[str, Any]] or None (final Contacts output rows)
         - master_status_updates: List[Dict[str, int]] or None (list of {row_index, status} dicts)
     """
-    # Build inputs dictionary (read-only source for COPY_SHEET tasks)
-    inputs = {
-        "URLs": urls_rows,
-        "Contacts": contacts_rows,
-        "Master": master_rows,
-    }
-    
-    # Build initial work dictionary from passed rows
-    # Only include sheets that have data (not None, even if empty list)
-    work: Dict[str, List[Dict[str, Any]]] = {}
-    
-    if contacts_rows is not None:
-        work["Contacts"] = contacts_rows
-    
-    if contacts_output_rows is not None:
-        work["Contacts output"] = contacts_output_rows
-    
-    if urls_rows is not None:
-        work["URLs"] = urls_rows
-    
-    if urls_output_rows is not None:
-        work["URLs output"] = urls_output_rows
-    
     print(f"[RECIPE][RUN] initial work sheets: {list(work.keys())}")
     
     # Guard rail: If work dict is empty, this is a hard error
     if not work:
-        error_msg = "[RECIPE] No sheets loaded into work dictionary. All tabs (Contacts, Contacts output, URLs, URLs output) are missing or empty."
+        error_msg = "[RECIPE] No sheets loaded into work dictionary. Spreadsheet appears to be empty."
         print(f"[RECIPE][RUN] ERROR: {error_msg}")
         return {
             "ok": False,
@@ -2744,6 +2779,26 @@ def run_recipe(project_id: str,
             "contacts_output": None,
             "master_status_updates": None,
         }
+    
+    # Extract Master sheet for task parsing
+    master_rows = work.get("Master", [])
+    if not master_rows:
+        error_msg = "[RECIPE] Master tab is missing or empty. Cannot run recipe without task definitions."
+        print(f"[RECIPE][RUN] ERROR: {error_msg}")
+        return {
+            "ok": False,
+            "errors": [error_msg],
+            "urls_output": None,
+            "contacts_output": None,
+            "master_status_updates": None,
+        }
+    
+    # Build inputs dictionary (read-only source for COPY_SHEET tasks)
+    # Only include input sheets that exist in work
+    inputs: Dict[str, List[Dict[str, Any]]] = {}
+    for sheet_name in INPUT_SHEETS:
+        if sheet_name in work:
+            inputs[sheet_name] = work[sheet_name]
     
     # Parse tasks
     tasks, errors = parse_master_tasks(master_rows)
@@ -2761,6 +2816,24 @@ def run_recipe(project_id: str,
     if not tasks or len(tasks) == 0:
         error_msg = "[RECIPE] Master tab contains zero runnable tasks. Cannot execute recipe."
         print(f"[RECIPE][RUN] ERROR: {error_msg}")
+        return {
+            "ok": False,
+            "errors": [error_msg],
+            "urls_output": None,
+            "contacts_output": None,
+            "master_status_updates": None,
+        }
+    
+    # Validate that all sheets referenced by tasks exist in work dictionary
+    referenced_sheets = _extract_referenced_sheets(tasks)
+    missing_sheets = []
+    for sheet_name in referenced_sheets:
+        if sheet_name not in work:
+            missing_sheets.append(sheet_name)
+    
+    if missing_sheets:
+        error_msg = f"[RECIPE][ERROR] The following sheets are referenced by tasks but do not exist in the spreadsheet: {', '.join(sorted(missing_sheets))}"
+        print(f"[RECIPE][RUN] {error_msg}")
         return {
             "ok": False,
             "errors": [error_msg],

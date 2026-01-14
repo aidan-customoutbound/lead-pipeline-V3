@@ -182,25 +182,36 @@ def process_run(run_row, supabase):
             
             log(f"[worker] [RECIPE] Using sheet_id={sheet_id} (from project_id, not prompts table)")
             
-            # Read all tabs we care about (if they exist)
-            # read_tab_as_rows returns [] if tab doesn't exist or is empty
-            urls_rows = read_tab_as_rows(service, sheet_id, "URLs")
-            contacts_rows = read_tab_as_rows(service, sheet_id, "Contacts")
-            urls_output_rows = read_tab_as_rows(service, sheet_id, "URLs output")
-            contacts_output_rows = read_tab_as_rows(service, sheet_id, "Contacts output")
-            master_rows = read_tab_as_rows(service, sheet_id, "Master")
+            # Get list of all sheets (tabs) in the spreadsheet
+            try:
+                spreadsheet_metadata = service.spreadsheets().get(
+                    spreadsheetId=sheet_id,
+                    includeGridData=False
+                ).execute()
+                
+                sheets_list = spreadsheet_metadata.get('sheets', [])
+                tab_titles = [sheet['properties']['title'] for sheet in sheets_list]
+                log(f"[worker] [RECIPE] Found {len(tab_titles)} tabs in spreadsheet: {', '.join(tab_titles)}")
+            except Exception as e:
+                raise ValueError(f"[RECIPE] Failed to get spreadsheet metadata for sheet_id={sheet_id}: {str(e)}")
             
-            log(f"[worker] [RECIPE] Read tabs: {len(urls_rows)} URLs, {len(contacts_rows)} Contacts, {len(urls_output_rows)} URLs output, {len(contacts_output_rows)} Contacts output, {len(master_rows)} Master")
+            # Load ALL tabs into work dictionary
+            work: Dict[str, List[Dict[str, Any]]] = {}
+            for tab_title in tab_titles:
+                rows = read_tab_as_rows(service, sheet_id, tab_title)
+                work[tab_title] = rows
+                log(f"[worker] [RECIPE] Loaded tab '{tab_title}': {len(rows)} rows")
             
             # Guard rail: Check if Master tab is missing or empty
+            master_rows = work.get("Master", [])
             if not master_rows or len(master_rows) == 0:
                 raise ValueError(f"[RECIPE] Master tab is missing or empty in sheet {sheet_id}. Cannot run recipe without task definitions.")
             
-            # Guard rail: Check if we have at least some data in one of the input/output tabs
+            # Guard rail: Check if we have at least some data in one tab (excluding Master)
             # This prevents silently running with empty work dict
-            total_rows = len(urls_rows) + len(contacts_rows) + len(urls_output_rows) + len(contacts_output_rows)
-            if total_rows == 0:
-                raise ValueError(f"[RECIPE] No data found in any tabs (Contacts, Contacts output, URLs, URLs output) in sheet {sheet_id}. Cannot run recipe with empty work dictionary.")
+            non_master_rows = sum(len(rows) for tab_name, rows in work.items() if tab_name != "Master")
+            if non_master_rows == 0:
+                raise ValueError(f"[RECIPE] No data found in any tabs (excluding Master) in sheet {sheet_id}. Cannot run recipe with empty work dictionary.")
             
             # Check if run is still active before running recipe
             if not is_run_active(supabase, run_id):
@@ -233,11 +244,7 @@ def process_run(run_row, supabase):
                 result = recipe_workflow.run_recipe(
                     project_id=project_id,
                     run_id=run_id,
-                    urls_rows=urls_rows,
-                    contacts_rows=contacts_rows,
-                    urls_output_rows=urls_output_rows,
-                    contacts_output_rows=contacts_output_rows,
-                    master_rows=master_rows,
+                    work=work,
                     progress_callback=recipe_progress_callback
                 )
             finally:
