@@ -1387,9 +1387,33 @@ def filter_blank(work: Dict[str, List[Dict[str, Any]]],
         work[sheet] = []
     
     rows = work[sheet]
+    
+    # Return early if no rows exist
+    if not rows:
+        return
+    
+    # Normalize the requested column name
+    normalized_column = column.strip().lower()
+    
+    # Build mapping from normalized header names to actual keys
+    first_row = rows[0]
+    header_map = {}
+    for key in first_row.keys():
+        normalized_key = key.strip().lower()
+        header_map[normalized_key] = key
+    
+    # Check if column exists
+    if normalized_column not in header_map:
+        available_columns = sorted([key for key in first_row.keys()])
+        print(f"[RECIPE] Column '{column}' not found in sheet '{sheet}'. Available columns: {available_columns}")
+        return
+    
+    # Get the actual column key
+    actual_column = header_map[normalized_column]
+    
     filtered = []
     for row in rows:
-        value = row.get(column)
+        value = row.get(actual_column)
         # Check if value is blank: None, empty string, or whitespace-only
         if value is None:
             continue  # Skip blank rows
