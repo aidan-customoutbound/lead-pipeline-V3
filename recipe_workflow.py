@@ -1384,12 +1384,14 @@ def filter_blank(work: Dict[str, List[Dict[str, Any]]],
         column: Column name to filter on
     """
     if sheet not in work:
-        work[sheet] = []
+        print(f"[RECIPE][FILTER_BLANK] sheet='{sheet}' not found in work, returning without modification")
+        return
     
     rows = work[sheet]
     
     # Return early if no rows exist
     if not rows:
+        print(f"[RECIPE][FILTER_BLANK] sheet='{sheet}' has no rows, returning without modification")
         return
     
     # Normalize the requested column name
@@ -1402,10 +1404,16 @@ def filter_blank(work: Dict[str, List[Dict[str, Any]]],
         normalized_key = key.strip().lower()
         header_map[normalized_key] = key
     
+    # Get available keys for logging
+    available_keys = list(first_row.keys())
+    rows_before = len(rows)
+    
+    # Log before filtering
+    print(f"[RECIPE][FILTER_BLANK] sheet='{sheet}', column='{column}', normalized='{normalized_column}', rows_before={rows_before}, keys={available_keys}")
+    
     # Check if column exists
     if normalized_column not in header_map:
-        available_columns = sorted([key for key in first_row.keys()])
-        print(f"[RECIPE] Column '{column}' not found in sheet '{sheet}'. Available columns: {available_columns}")
+        print(f"[RECIPE][FILTER_BLANK] column='{column}' not found in sheet='{sheet}', available_keys={available_keys}")
         return
     
     # Get the actual column key
@@ -1421,7 +1429,11 @@ def filter_blank(work: Dict[str, List[Dict[str, Any]]],
         if value_str:  # Non-empty after strip, keep the row
             filtered.append(row)
     
+    rows_after = len(filtered)
     work[sheet] = filtered
+    
+    # Log after filtering
+    print(f"[RECIPE][FILTER_BLANK] sheet='{sheet}', actual_key='{actual_column}', rows_after={rows_after}")
 
 
 def filter_match(work: Dict[str, List[Dict[str, Any]]],
