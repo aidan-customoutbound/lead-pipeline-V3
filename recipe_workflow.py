@@ -1270,12 +1270,27 @@ def copy_sheet(inputs: Dict[str, List[Dict[str, Any]]],
         source_sheet: Name of source sheet in inputs
         target_sheet: Name of target sheet in work
     """
-    if source_sheet not in inputs:
-        raise ValueError(f"Source sheet '{source_sheet}' not found in inputs")
+    print(f"[RECIPE][COPY_SHEET] Source sheet name: {source_sheet}")
+    print(f"[RECIPE][COPY_SHEET] Target sheet name: {target_sheet}")
+    
+    source_exists_in_work = source_sheet in work
+    print(f"[RECIPE][COPY_SHEET] Source exists in work: {source_exists_in_work}")
+    
+    if not source_exists_in_work:
+        print(f"[RECIPE][COPY_SHEET] WARNING: Source sheet '{source_sheet}' does not exist in work")
+        work[target_sheet] = []
+        print(f"[RECIPE][COPY_SHEET] Final count in work[{target_sheet}]: 0")
+        return
+    
+    source_rows = work[source_sheet]
+    source_row_count = len(source_rows)
+    print(f"[RECIPE][COPY_SHEET] Rows in source: {source_row_count}")
     
     # Deep copy the rows
-    source_rows = inputs[source_sheet]
     work[target_sheet] = [row.copy() for row in source_rows]
+    copied_count = len(work[target_sheet])
+    print(f"[RECIPE][COPY_SHEET] Rows copied: {copied_count}")
+    print(f"[RECIPE][COPY_SHEET] Final count in work[{target_sheet}]: {copied_count}")
 
 
 def deduplicate(work: Dict[str, List[Dict[str, Any]]],
