@@ -2679,6 +2679,8 @@ def run_recipe(project_id: str,
                urls_rows: List[Dict[str, Any]],
                contacts_rows: List[Dict[str, Any]],
                master_rows: List[Dict[str, Any]],
+               urls_output_rows: Optional[List[Dict[str, Any]]] = None,
+               contacts_output_rows: Optional[List[Dict[str, Any]]] = None,
                progress_callback: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
     """
     Main entry point for the recipe engine.
@@ -2694,6 +2696,8 @@ def run_recipe(project_id: str,
         urls_rows: Snapshot of URLs sheet rows
         contacts_rows: Snapshot of Contacts sheet rows
         master_rows: Snapshot of Master sheet rows
+        urls_output_rows: Optional snapshot of URLs output sheet rows (if tab exists)
+        contacts_output_rows: Optional snapshot of Contacts output sheet rows (if tab exists)
         progress_callback: Optional callback function(row_index: int, status: str) called after each task completes
         
     Returns:
@@ -2704,16 +2708,42 @@ def run_recipe(project_id: str,
         - contacts_output: List[Dict[str, Any]] or None (final Contacts output rows)
         - master_status_updates: List[Dict[str, int]] or None (list of {row_index, status} dicts)
     """
-    # Build inputs dictionary
+    # Build inputs dictionary (read-only source for COPY_SHEET tasks)
     inputs = {
         "URLs": urls_rows,
         "Contacts": contacts_rows,
         "Master": master_rows,
     }
     
-    # Build initial work dictionary (empty)
+    # Build initial work dictionary from passed rows
+    # Only include sheets that have data (not None, even if empty list)
     work: Dict[str, List[Dict[str, Any]]] = {}
+    
+    if contacts_rows is not None:
+        work["Contacts"] = contacts_rows
+    
+    if contacts_output_rows is not None:
+        work["Contacts output"] = contacts_output_rows
+    
+    if urls_rows is not None:
+        work["URLs"] = urls_rows
+    
+    if urls_output_rows is not None:
+        work["URLs output"] = urls_output_rows
+    
     print(f"[RECIPE][RUN] initial work sheets: {list(work.keys())}")
+    
+    # Guard rail: If work dict is empty, this is a hard error
+    if not work:
+        error_msg = "[RECIPE] No sheets loaded into work dictionary. All tabs (Contacts, Contacts output, URLs, URLs output) are missing or empty."
+        print(f"[RECIPE][RUN] ERROR: {error_msg}")
+        return {
+            "ok": False,
+            "errors": [error_msg],
+            "urls_output": None,
+            "contacts_output": None,
+            "master_status_updates": None,
+        }
     
     # Parse tasks
     tasks, errors = parse_master_tasks(master_rows)
@@ -2722,6 +2752,18 @@ def run_recipe(project_id: str,
         return {
             "ok": False,
             "errors": errors,
+            "urls_output": None,
+            "contacts_output": None,
+            "master_status_updates": None,
+        }
+    
+    # Guard rail: Check if Master tab has zero runnable tasks
+    if not tasks or len(tasks) == 0:
+        error_msg = "[RECIPE] Master tab contains zero runnable tasks. Cannot execute recipe."
+        print(f"[RECIPE][RUN] ERROR: {error_msg}")
+        return {
+            "ok": False,
+            "errors": [error_msg],
             "urls_output": None,
             "contacts_output": None,
             "master_status_updates": None,

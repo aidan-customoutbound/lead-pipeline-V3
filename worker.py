@@ -174,21 +174,33 @@ def process_run(run_row, supabase):
             if not service:
                 raise ValueError("Could not create Google Sheets service. Check GOOGLE_SA_JSON environment variable.")
             
-            # Get sheet_id for this project
-            # This will fall back to project_id if not found in prompts table (safe for recipe runs)
-            sheet_id = get_sheet_id_for_project(project_id, supabase)
+            # For recipe runs, project_id IS the Google Sheet ID
+            # Do NOT use get_sheet_id_for_project or read from prompts table
+            sheet_id = project_id
             if not sheet_id:
-                # This should only happen if project_id itself is invalid/empty
-                raise ValueError(f"Invalid project_id: {project_id}")
+                raise ValueError(f"Invalid project_id (sheet_id): {project_id}")
             
-            log(f"[worker] Reading tabs from sheet_id={sheet_id}")
+            log(f"[worker] [RECIPE] Using sheet_id={sheet_id} (from project_id, not prompts table)")
             
-            # Read input tabs
+            # Read all tabs we care about (if they exist)
+            # read_tab_as_rows returns [] if tab doesn't exist or is empty
             urls_rows = read_tab_as_rows(service, sheet_id, "URLs")
             contacts_rows = read_tab_as_rows(service, sheet_id, "Contacts")
+            urls_output_rows = read_tab_as_rows(service, sheet_id, "URLs output")
+            contacts_output_rows = read_tab_as_rows(service, sheet_id, "Contacts output")
             master_rows = read_tab_as_rows(service, sheet_id, "Master")
             
-            log(f"[worker] Read {len(urls_rows)} URLs rows, {len(contacts_rows)} Contacts rows, {len(master_rows)} Master rows")
+            log(f"[worker] [RECIPE] Read tabs: {len(urls_rows)} URLs, {len(contacts_rows)} Contacts, {len(urls_output_rows)} URLs output, {len(contacts_output_rows)} Contacts output, {len(master_rows)} Master")
+            
+            # Guard rail: Check if Master tab is missing or empty
+            if not master_rows or len(master_rows) == 0:
+                raise ValueError(f"[RECIPE] Master tab is missing or empty in sheet {sheet_id}. Cannot run recipe without task definitions.")
+            
+            # Guard rail: Check if we have at least some data in one of the input/output tabs
+            # This prevents silently running with empty work dict
+            total_rows = len(urls_rows) + len(contacts_rows) + len(urls_output_rows) + len(contacts_output_rows)
+            if total_rows == 0:
+                raise ValueError(f"[RECIPE] No data found in any tabs (Contacts, Contacts output, URLs, URLs output) in sheet {sheet_id}. Cannot run recipe with empty work dictionary.")
             
             # Check if run is still active before running recipe
             if not is_run_active(supabase, run_id):
@@ -223,6 +235,8 @@ def process_run(run_row, supabase):
                     run_id=run_id,
                     urls_rows=urls_rows,
                     contacts_rows=contacts_rows,
+                    urls_output_rows=urls_output_rows,
+                    contacts_output_rows=contacts_output_rows,
                     master_rows=master_rows,
                     progress_callback=recipe_progress_callback
                 )
