@@ -44,6 +44,7 @@ TASK_INSERT_COLUMN = "INSERT_COLUMN"
 TASK_COPY_COLUMNS = "COPY_COLUMNS"
 TASK_AI = "AI"
 TASK_EXA = "EXA"
+TASK_COUNT_MATCHES = "COUNT_MATCHES"
 
 # Input sheet names (read-only)
 INPUT_SHEETS = {"URLs", "Contacts", "Master"}
@@ -310,6 +311,38 @@ def _parse_count_by(task_name: str) -> Optional[Dict[str, Any]]:
     output_column = match.group(3).strip()
     
     return {"sheet": sheet, "group_column": group_column, "output_column": output_column}
+
+
+def _parse_count_matches(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Count matches - (SOURCE_SHEET, GROUP_COLUMN, TARGET_SHEET, TARGET_COLUMN, COUNT_COLUMN)' pattern.
+    
+    Returns:
+        Dict with 'source_sheet', 'group_column', 'target_sheet', 'target_column', and 'count_column' keys,
+        or None if parse fails
+    """
+    # Match the pattern: "Count matches - (param1, param2, param3, param4, param5)"
+    pattern = r'^Count matches\s*-\s*\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)$'
+    match = re.match(pattern, task_name, re.IGNORECASE)
+    if not match:
+        return None
+    
+    # Extract and trim all 5 parameters
+    params = [match.group(i).strip() for i in range(1, 6)]
+    
+    # Validate that all parameters are non-empty
+    if not all(params):
+        return None
+    
+    source_sheet, group_column, target_sheet, target_column, count_column = params
+    
+    return {
+        "source_sheet": source_sheet,
+        "group_column": group_column,
+        "target_sheet": target_sheet,
+        "target_column": target_column,
+        "count_column": count_column
+    }
 
 
 def _parse_sort(task_name: str) -> Optional[Dict[str, Any]]:
@@ -1054,6 +1087,25 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         if not lookup_sheet:
             return f"Row {row_index}: Lookup sheet is required"
     
+    elif task_type == TASK_COUNT_MATCHES:
+        source_sheet = params.get("source_sheet")
+        group_column = params.get("group_column")
+        target_sheet = params.get("target_sheet")
+        target_column = params.get("target_column")
+        count_column = params.get("count_column")
+        
+        # Validate that all required fields are non-empty
+        if not source_sheet:
+            return f"Row {row_index}: Count matches task source_sheet is required"
+        if not group_column:
+            return f"Row {row_index}: Count matches task group_column is required"
+        if not target_sheet:
+            return f"Row {row_index}: Count matches task target_sheet is required"
+        if not target_column:
+            return f"Row {row_index}: Count matches task target_column is required"
+        if not count_column:
+            return f"Row {row_index}: Count matches task count_column is required"
+    
     elif task_type == TASK_MAP:
         target_sheet = params.get("target_sheet")
         lookup_sheet = params.get("lookup_sheet")
@@ -1250,6 +1302,11 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             if parsed:
                 task_type = TASK_COUNT_BY
                 params = parsed
+        elif task_name.lower().startswith("count matches"):
+            parsed = _parse_count_matches(task_name)
+            if parsed:
+                task_type = TASK_COUNT_MATCHES
+                params = parsed
         elif task_name.lower().startswith("sort"):
             parsed = _parse_sort(task_name)
             if parsed:
@@ -1364,6 +1421,9 @@ def _extract_referenced_sheets(tasks: List[RecipeTask]) -> set:
             referenced_sheets.add(params.get("lookup_sheet"))
         elif task.type == TASK_COUNT_BY:
             referenced_sheets.add(params.get("sheet"))
+        elif task.type == TASK_COUNT_MATCHES:
+            referenced_sheets.add(params.get("source_sheet"))
+            referenced_sheets.add(params.get("target_sheet"))
         elif task.type == TASK_SORT:
             referenced_sheets.add(params.get("sheet"))
         elif task.type == TASK_REMOVE_CHARACTERS:
@@ -1716,6 +1776,76 @@ def count_by(work: Dict[str, List[Dict[str, Any]]],
     for row in rows:
         value = _safe_str(row.get(group_column)).lower()
         row[output_column] = counts.get(value, 0)
+
+
+def count_matches(work: Dict[str, List[Dict[str, Any]]],
+                  source_sheet: str,
+                  group_column: str,
+                  target_sheet: str,
+                  target_column: str,
+                  count_column: str) -> None:
+    """
+    Count matches from source_sheet and write counts to target_sheet.
+    
+    Builds a frequency dictionary from source_sheet rows grouped by group_column,
+    then writes the count for each matching value in target_sheet to count_column.
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        source_sheet: Name of source sheet in work (to count from)
+        group_column: Column name in source sheet to group by
+        target_sheet: Name of target sheet in work (to write counts to)
+        target_column: Column name in target sheet to match against
+        count_column: Column name in target sheet to write count to
+    """
+    # Check if source sheet exists
+    if source_sheet not in work:
+        print(f"[RECIPE][COUNT_MATCHES] Source sheet missing")
+        # Note: We don't have access to errors list here, so we just log and return
+        # The caller should handle this validation before calling
+        return
+    
+    # Check if target sheet exists
+    if target_sheet not in work:
+        print(f"[RECIPE][COUNT_MATCHES] Target sheet missing")
+        return
+    
+    source_rows = work[source_sheet]
+    target_rows = work[target_sheet]
+    
+    # Log start
+    print(f"[RECIPE][COUNT_MATCHES] sheet_source={source_sheet}, sheet_target={target_sheet}, rows_source={len(source_rows)}, rows_target={len(target_rows)}")
+    
+    # Step A: Build frequency dictionary from source_sheet rows
+    count_dict: Dict[str, int] = {}
+    for row in source_rows:
+        # Get value from group_column, treat missing as ""
+        value = row.get(group_column, "")
+        if value is None:
+            value = ""
+        value = str(value).strip()
+        count_dict[value] = count_dict.get(value, 0) + 1
+    
+    # Log count of distinct keys
+    distinct_keys = len(count_dict)
+    print(f"[RECIPE][COUNT_MATCHES] distinct_keys={distinct_keys}")
+    
+    # Step B: For every row in target_sheet, write count
+    for row in target_rows:
+        # Get key from target_column, treat missing as ""
+        key = row.get(target_column, "")
+        if key is None:
+            key = ""
+        key = str(key).strip()
+        
+        # Get count from dictionary (default to 0 if not found)
+        count = count_dict.get(key, 0)
+        
+        # Write count to count_column (create if doesn't exist, overwrite if exists)
+        row[count_column] = count
+    
+    # Log end
+    print(f"[RECIPE][COUNT_MATCHES] completed")
 
 
 def sort_rows(work: Dict[str, List[Dict[str, Any]]],
@@ -3127,6 +3257,15 @@ def run_recipe(project_id: str,
                     task.params["sheet"],
                     task.params["group_column"],
                     task.params["output_column"]
+                )
+            elif task.type == TASK_COUNT_MATCHES:
+                count_matches(
+                    work,
+                    task.params["source_sheet"],
+                    task.params["group_column"],
+                    task.params["target_sheet"],
+                    task.params["target_column"],
+                    task.params["count_column"]
                 )
             elif task.type == TASK_SORT:
                 sort_rows(
