@@ -2713,6 +2713,7 @@ def run_recipe(project_id: str,
     
     # Build initial work dictionary (empty)
     work: Dict[str, List[Dict[str, Any]]] = {}
+    print(f"[RECIPE][RUN] initial work sheets: {list(work.keys())}")
     
     # Parse tasks
     tasks, errors = parse_master_tasks(master_rows)
