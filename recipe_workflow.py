@@ -941,25 +941,19 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         source = params.get("source")
         target = params.get("target")
         
-        # Source must be an input sheet
-        if source not in INPUT_SHEETS:
-            return f"Row {row_index}: Copy sheet source must be an input sheet (URLs, Contacts, or Master), got '{source}'"
-        
-        # Target must be an output sheet
-        if target not in OUTPUT_SHEETS:
-            return f"Row {row_index}: Copy sheet target must be an output sheet (URLs output or Contacts output), got '{target}'"
-        
-        # Cannot copy from input to input
-        if target in INPUT_SHEETS:
-            return f"Row {row_index}: Copy sheet target cannot be an input sheet, got '{target}'"
+        # Validate that all required fields are non-empty
+        if not source:
+            return f"Row {row_index}: Copy sheet source is required"
+        if not target:
+            return f"Row {row_index}: Copy sheet target is required"
     
     elif task_type in (TASK_DEDUPLICATE, TASK_NORMALIZE_URLS, TASK_FILTER_INCLUDE, 
                        TASK_FILTER_EXCLUDE, TASK_FILTER_BLANK, TASK_COUNT_BY, TASK_SORT, TASK_REMOVE_CHARACTERS, TASK_CONCATENATE):
         sheet = params.get("sheet")
         
-        # Sheet must be an output sheet
-        if sheet not in OUTPUT_SHEETS:
-            return f"Row {row_index}: Operation on '{sheet}' is not allowed. Only output sheets (URLs output, Contacts output) can be used for non-copy operations"
+        # Validate that all required fields are non-empty
+        if not sheet:
+            return f"Row {row_index}: Sheet name is required"
     
     elif task_type == TASK_REMOVE_TEXT:
         sheet_name = params.get("sheet_name")
@@ -973,39 +967,33 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
             return f"Row {row_index}: Remove text task column_name is required"
         if not phrases or not isinstance(phrases, list) or len(phrases) == 0:
             return f"Row {row_index}: Remove text task must have at least one phrase"
-        
-        # Sheet must be an output sheet
-        if sheet_name not in OUTPUT_SHEETS:
-            return f"Row {row_index}: Operation on '{sheet_name}' is not allowed. Only output sheets (URLs output, Contacts output) can be used for non-copy operations"
     
     elif task_type in (TASK_FILTER_MATCH, TASK_FILTER_NOT_MATCH):
         source_sheet = params.get("source_sheet")
         lookup_sheet = params.get("lookup_sheet")
         
-        # Both sheets must be output sheets
-        if source_sheet not in OUTPUT_SHEETS:
-            return f"Row {row_index}: Source sheet '{source_sheet}' must be an output sheet (URLs output or Contacts output)"
-        
-        if lookup_sheet not in OUTPUT_SHEETS:
-            return f"Row {row_index}: Lookup sheet '{lookup_sheet}' must be an output sheet (URLs output or Contacts output)"
+        # Validate that all required fields are non-empty
+        if not source_sheet:
+            return f"Row {row_index}: Source sheet is required"
+        if not lookup_sheet:
+            return f"Row {row_index}: Lookup sheet is required"
     
     elif task_type == TASK_MAP:
         target_sheet = params.get("target_sheet")
         lookup_sheet = params.get("lookup_sheet")
         
-        # Both sheets must be output sheets
-        if target_sheet not in OUTPUT_SHEETS:
-            return f"Row {row_index}: Target sheet '{target_sheet}' must be an output sheet (URLs output or Contacts output)"
-        
-        if lookup_sheet not in OUTPUT_SHEETS:
-            return f"Row {row_index}: Lookup sheet '{lookup_sheet}' must be an output sheet (URLs output or Contacts output)"
+        # Validate that all required fields are non-empty
+        if not target_sheet:
+            return f"Row {row_index}: Target sheet is required"
+        if not lookup_sheet:
+            return f"Row {row_index}: Lookup sheet is required"
     
     elif task_type == TASK_ASSIGN_OTHER:
         sheet_name = params.get("sheet_name")
         
-        # Sheet must be an output sheet
-        if sheet_name not in OUTPUT_SHEETS:
-            return f"Row {row_index}: Operation on '{sheet_name}' is not allowed. Only output sheets (URLs output, Contacts output) can be used for non-copy operations"
+        # Validate that all required fields are non-empty
+        if not sheet_name:
+            return f"Row {row_index}: Sheet name is required"
     
     elif task_type == TASK_COPY_BY_KEY:
         source_sheet_name = params.get("source_sheet_name")
@@ -1022,13 +1010,6 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
             return f"Row {row_index}: Copy by key task target_sheet_name is required"
         if not target_key_column:
             return f"Row {row_index}: Copy by key task target_key_column is required"
-        
-        # Both sheets must be output sheets (similar to Map task)
-        if source_sheet_name not in OUTPUT_SHEETS:
-            return f"Row {row_index}: Source sheet '{source_sheet_name}' must be an output sheet (URLs output or Contacts output)"
-        
-        if target_sheet_name not in OUTPUT_SHEETS:
-            return f"Row {row_index}: Target sheet '{target_sheet_name}' must be an output sheet (URLs output or Contacts output)"
     
     elif task_type == TASK_INSERT_COLUMN:
         sheet_name = params.get("sheet_name")
@@ -1039,10 +1020,6 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
             return f"Row {row_index}: Insert column task sheet_name is required"
         if not column_name:
             return f"Row {row_index}: Insert column task column_name is required"
-        
-        # Sheet must be an output sheet
-        if sheet_name not in OUTPUT_SHEETS:
-            return f"Row {row_index}: Operation on '{sheet_name}' is not allowed. Only output sheets (URLs output, Contacts output) can be used for non-copy operations"
     
     elif task_type == TASK_AI:
         input_sheet_name = params.get("input_sheet_name")
@@ -1273,8 +1250,8 @@ def _extract_referenced_sheets(tasks: List[RecipeTask]) -> set:
         params = task.params
         
         if task.type == TASK_COPY_SHEET:
+            # Only source is required to exist; target can be created
             referenced_sheets.add(params.get("source"))
-            referenced_sheets.add(params.get("target"))
         elif task.type == TASK_DEDUPLICATE:
             referenced_sheets.add(params.get("sheet"))
         elif task.type == TASK_NORMALIZE_URLS:
@@ -2827,16 +2804,18 @@ def run_recipe(project_id: str,
     # Validate that all sheets referenced by tasks exist in work dictionary
     referenced_sheets = _extract_referenced_sheets(tasks)
     missing_sheets = []
+    errors = []
     for sheet_name in referenced_sheets:
         if sheet_name not in work:
             missing_sheets.append(sheet_name)
+            error_msg = f"[RECIPE][ERROR] sheet '{sheet_name}' not found in work; available sheets={list(work.keys())}"
+            print(f"[RECIPE][RUN] {error_msg}")
+            errors.append(error_msg)
     
     if missing_sheets:
-        error_msg = f"[RECIPE][ERROR] The following sheets are referenced by tasks but do not exist in the spreadsheet: {', '.join(sorted(missing_sheets))}"
-        print(f"[RECIPE][RUN] {error_msg}")
         return {
             "ok": False,
-            "errors": [error_msg],
+            "errors": errors,
             "urls_output": None,
             "contacts_output": None,
             "master_status_updates": None,
