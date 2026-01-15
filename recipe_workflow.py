@@ -504,62 +504,71 @@ def _parse_map(task_name: str) -> Optional[Dict[str, Any]]:
 
 def _parse_assign_other(task_name: str) -> Optional[Dict[str, Any]]:
     """
-    Parse 'Assign other - (SheetName, GroupColumn, SourceCol1:TargetCol1 | SourceCol2:TargetCol2 | ...)' pattern.
+    Parse 'Assign other - (SheetName, GroupColumn, SourceCol1:DestCol1 | SourceCol2:DestCol2 | ...)' pattern.
     
     Syntax examples:
-        Assign other - (Contacts output, Website, Owner:Group Owner)
-        Assign other - (Contacts output, Website, Owner:Group Owner | Account Tier:Group Tier)
-        assign other-(Contacts output, Company, AE:Group AE | CSM:Group CSM)
+        Assign other - (Contacts output, Website, First Name:Other First | Last Name:Other Last)
+        Assign other - (Contacts output, Website, First Name:Other First)
     
     Returns:
-        Dict with 'sheet', 'group_column', and 'mappings' (list of {source, target} dicts) keys, or None if parse fails
+        Dict with 'sheet', 'group_column', and 'mappings' (list of (source_col, dest_col) tuples) keys, or None if parse fails
     """
-    # Pattern: Assign other - (SheetName, GroupColumn, SourceCol1:TargetCol1 | SourceCol2:TargetCol2 | ...)
-    pattern = r'^Assign other\s*-\s*\(([^,]+),\s*([^,]+),\s*(.+)\)$'
+    # Pattern: Assign other - (SheetName, GroupColumn, SourceCol1:DestCol1 | SourceCol2:DestCol2 | ...)
+    # Use regex to capture content between parentheses
+    pattern = r'^Assign other\s*-\s*\((.+)\)$'
     match = re.match(pattern, task_name, re.IGNORECASE)
     if not match:
         return None
     
-    sheet = match.group(1).strip()
-    group_column = match.group(2).strip()
-    mappings_raw = match.group(3).strip()
+    content = match.group(1).strip()
     
-    # Validate that sheet and group_column are non-empty
-    if not sheet or not group_column:
+    # Split on commas at the top level to extract SheetName, GroupColumn, mappings_string
+    # We need to be careful about commas inside column names, so we'll split on comma and take first 3 parts
+    parts = [p.strip() for p in content.split(',', 2)]
+    
+    if len(parts) < 3:
         return None
     
-    # Parse the mappings string (pipe-separated list of SourceCol:TargetCol pairs)
-    mappings = []
-    raw_parts = [p.strip() for p in mappings_raw.split("|")]
+    sheet_name = parts[0].strip()
+    group_column = parts[1].strip()
+    mappings_string = parts[2].strip()
     
-    for part in raw_parts:
-        if not part:
-            continue  # Skip empty parts
-        
-        # Each mapping must contain a colon
-        if ":" not in part:
+    # Validate that sheet and group_column are non-empty
+    if not sheet_name or not group_column:
+        return None
+    
+    # Parse the mappings string (pipe-separated list of SourceCol:DestCol pairs)
+    segments = [s.strip() for s in mappings_string.split("|") if s.strip()]
+    
+    if not segments:
+        return None  # Must have at least one mapping
+    
+    mappings = []
+    for segment in segments:
+        # Each segment must be of the form SourceCol:DestCol
+        if ":" not in segment:
             return None  # Malformed mapping
         
-        # Split by colon (only split on first colon in case column names contain colons)
-        colon_pos = part.find(":")
-        if colon_pos == -1 or colon_pos == 0 or colon_pos == len(part) - 1:
+        # Split on first colon only
+        colon_pos = segment.find(":")
+        if colon_pos == -1 or colon_pos == 0 or colon_pos == len(segment) - 1:
             return None  # Malformed mapping
         
-        source_col = part[:colon_pos].strip()
-        target_col = part[colon_pos + 1:].strip()
+        source_col = segment[:colon_pos].strip()
+        dest_col = segment[colon_pos + 1:].strip()
         
-        # Both source and target column names must be non-empty
-        if not source_col or not target_col:
+        # Both source and dest column names must be non-empty
+        if not source_col or not dest_col:
             return None
         
-        mappings.append({"source": source_col, "target": target_col})
+        mappings.append((source_col, dest_col))
     
     # Must have at least one mapping
     if not mappings:
         return None
     
     return {
-        "sheet": sheet,
+        "sheet": sheet_name,
         "group_column": group_column,
         "mappings": mappings
     }
@@ -1099,20 +1108,21 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         
         # Validate that all required fields are non-empty
         if not sheet:
-            return f"Row {row_index}: Sheet name is required"
+            return f"Assign other: sheet name is required"
         if not group_column:
-            return f"Row {row_index}: Group column is required"
+            return f"Assign other: group column is required"
         if not mappings or not isinstance(mappings, list) or len(mappings) == 0:
-            return f"Row {row_index}: Mappings list is required and must be non-empty"
+            return f"Assign other: at least one Source:Dest mapping is required"
         
         # Validate each mapping
         for i, mapping in enumerate(mappings):
-            if not isinstance(mapping, dict):
-                return f"Row {row_index}: Mapping {i+1} must be a dictionary"
-            source = mapping.get("source")
-            target = mapping.get("target")
-            if not source or not target:
-                return f"Row {row_index}: Mapping {i+1} must have non-empty source and target columns"
+            if not isinstance(mapping, (tuple, list)) or len(mapping) != 2:
+                return f"Assign other: mapping {i+1} must be a (source, dest) tuple"
+            source_col = mapping[0]
+            dest_col = mapping[1]
+            if not source_col or not dest_col:
+                mapping_str = f"{source_col or '?'}:{dest_col or '?'}"
+                return f"Assign other: mapping '{mapping_str}' is missing source or dest column"
     
     elif task_type == TASK_COPY_BY_KEY:
         source_sheet = params.get("source_sheet")
@@ -2129,97 +2139,112 @@ def concatenate(
 
 def assign_other(
     work: Dict[str, List[Dict[str, Any]]],
-    sheet: str,
+    sheet_name: str,
     group_column: str,
-    mappings: List[Dict[str, str]],
+    mappings: List[Tuple[str, str]],
     errors: List[str],
 ) -> None:
     """
-    For each group of rows defined by GroupColumn, find a representative value from a source column,
-    then assign that same value into a target column for EVERY row in that group.
+    Assign "colleague" information to each row in a sheet, based on grouping and rotating across colleagues in that group.
     
     Syntax examples:
-        Assign other - (Contacts output, Website, Owner:Group Owner)
-        Assign other - (Contacts output, Website, Owner:Group Owner | Account Tier:Group Tier)
+        Assign other - (Contacts output, Website, First Name:Other First | Last Name:Other Last)
+        Assign other - (Contacts output, Website, First Name:Other First)
     
     Behavior:
-    1. Group rows by GroupColumn value (treating None as "", stripping whitespace).
-    2. For each group and each mapping SourceCol:TargetCol:
-       a) Collect candidate values from SourceCol in all rows of the group.
-       b) Determine group_value = first non-empty value encountered (or "" if none).
-       c) Write group_value to TargetCol for every row in that group.
+    1. Group rows by GroupColumn value (case-sensitive, treating None as "").
+    2. For each row, choose a different colleague in the same group.
+    3. Copy values from the colleague's Source columns into the current row's Dest columns.
+    4. Enforce that the primary mapping (first mapping) has different values between current and colleague.
+    5. Use deterministic rotation to select colleagues.
     
     Args:
         work: Dictionary mapping sheet names to their row lists (mutated)
-        sheet: Name of sheet in work to process
+        sheet_name: Name of sheet in work to process
         group_column: Column name to group rows by
-        mappings: List of dicts with 'source' and 'target' keys for column mappings
+        mappings: List of (source_col, dest_col) tuples for column mappings
         errors: List to append error messages to
     """
-    # Check sheet
-    if sheet not in work:
-        error_msg = f"Assign other: sheet '{sheet}' not found"
-        print(f"[RECIPE][ASSIGN_OTHER][ERROR] sheet='{sheet}' not found; available sheets={list(work.keys())}")
-        errors.append(error_msg)
+    # Check sheet existence
+    if sheet_name not in work:
+        print(f"[RECIPE][ASSIGN_OTHER][WARN] sheet='{sheet_name}' not found in work; available_sheets={list(work.keys())}")
+        errors.append(f"Assign other: sheet '{sheet_name}' not found")
         return
     
-    # Get rows
-    rows = work[sheet]
+    # Load rows
+    rows = work[sheet_name]
     
     if not rows:
-        print(f"[RECIPE][ASSIGN_OTHER] sheet='{sheet}' has no rows; nothing to assign")
-        return
-    
-    # Check group_column presence
-    group_column_found = False
-    for row in rows:
-        if group_column in row:
-            group_column_found = True
-            break
-    
-    if not group_column_found:
-        error_msg = f"Assign other: group_column '{group_column}' not found in any rows of sheet '{sheet}'"
-        print(f"[RECIPE][ASSIGN_OTHER][ERROR] group_column='{group_column}' not found in any rows of sheet='{sheet}'")
-        errors.append(error_msg)
+        print(f"[RECIPE][ASSIGN_OTHER] sheet='{sheet_name}' has no rows; nothing to assign")
         return
     
     # Log start
-    print(f"[RECIPE][ASSIGN_OTHER] sheet='{sheet}', group_column='{group_column}', mappings={mappings}, row_count={len(rows)}")
+    print(f"[RECIPE][ASSIGN_OTHER] sheet='{sheet_name}', group_column='{group_column}', mappings={mappings}, total_rows={len(rows)}")
     
-    # Build groups
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for row in rows:
-        raw_key = row.get(group_column, "")
-        if raw_key is None:
-            raw_key = ""
-        key = str(raw_key).strip()
-        groups.setdefault(key, []).append(row)
+    # Determine primary mapping (first mapping)
+    primary_source_col, primary_dest_col = mappings[0]
     
-    # Process each group
-    for group_key, group_rows in groups.items():
-        # For each mapping in mappings (source, target)
-        for mapping in mappings:
-            source = mapping["source"]
-            target = mapping["target"]
+    # Build grouping: group_value -> list of row indices
+    groups: Dict[str, List[int]] = {}
+    for idx, row in enumerate(rows):
+        group_value = str(row.get(group_column, "") or "")
+        groups.setdefault(group_value, []).append(idx)
+    
+    # Process each group independently
+    for group_value, group_indices in groups.items():
+        print(f"[RECIPE][ASSIGN_OTHER] group='{group_value}', size={len(group_indices)}")
+        
+        # For each row in the group (by relative position k)
+        for k, row_idx in enumerate(group_indices):
+            current_row = rows[row_idx]
             
-            # Determine group_value
-            group_value = ""
-            for row in group_rows:
-                raw = row.get(source, "")
-                if raw is None:
-                    raw = ""
-                val = str(raw).strip()
-                if val:
-                    group_value = val
-                    break  # First non-empty wins
+            # Build candidate_indices
+            candidate_indices = []
             
-            # Assign to all rows in group
-            for row in group_rows:
-                row[target] = group_value
+            for candidate_idx in group_indices:
+                # Skip self
+                if candidate_idx == row_idx:
+                    continue
+                
+                candidate_row = rows[candidate_idx]
+                
+                # Check primary mapping inequality
+                curr_val = str(current_row.get(primary_source_col, "") or "").strip()
+                other_val = str(candidate_row.get(primary_source_col, "") or "").strip()
+                
+                # If both are non-empty and equal, skip this candidate
+                if curr_val and other_val and curr_val == other_val:
+                    continue
+                
+                # Check at least one non-empty mapping source
+                has_non_empty = False
+                for source_col, _ in mappings:
+                    val = str(candidate_row.get(source_col, "") or "").strip()
+                    if val:
+                        has_non_empty = True
+                        break
+                
+                if not has_non_empty:
+                    continue
+                
+                # Candidate is valid
+                candidate_indices.append(candidate_idx)
+            
+            # If no eligible candidates, skip this row
+            if not candidate_indices:
+                continue
+            
+            # Choose candidate with rotation
+            chosen_idx = candidate_indices[k % len(candidate_indices)]
+            chosen_row = rows[chosen_idx]
+            
+            # Write values from chosen colleague to current row
+            for source_col, dest_col in mappings:
+                value = chosen_row.get(source_col, "")
+                current_row[dest_col] = value
     
-    # Assign back and log
-    work[sheet] = rows
-    print(f"[RECIPE][ASSIGN_OTHER] completed sheet='{sheet}', group_column='{group_column}', groups_processed={len(groups)}")
+    # Log completion
+    print(f"[RECIPE][ASSIGN_OTHER] completed sheet='{sheet_name}'")
 
 
 def map_task(work: Dict[str, List[Dict[str, Any]]],
