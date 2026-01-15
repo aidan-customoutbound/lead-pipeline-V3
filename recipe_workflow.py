@@ -773,162 +773,172 @@ def _parse_exa_condition(condition_segment: str) -> Optional[Dict[str, str]]:
     }
 
 
-def _parse_ai_condition(condition_segment: str) -> Optional[Dict[str, str]]:
+def _parse_ai_condition(condition_expr_raw: str) -> Dict[str, Any]:
     """
-    Parse a WHEN condition segment: 'WHEN ColumnName contains "Text"'
+    Parse a ConditionExpression following the new DSL.
+    
+    Supports:
+    - Single expressions: {ColumnName} contains "Text", {ColumnName} blank, {ColumnName} not blank
+    - Multiple expressions with AND or OR: {Col1} contains "Text1" AND {Col2} blank
     
     Args:
-        condition_segment: The condition segment string (e.g., 'WHEN Title contains "manager"')
+        condition_expr_raw: The condition expression string
         
     Returns:
-        Dict with 'column_name' and 'substring' keys, or None if parse fails
+        Dict with 'valid', 'logic' ('AND', 'OR', None), and 'clauses' (list of clause dicts)
     """
-    condition_segment = condition_segment.strip()
+    condition_expr_raw = condition_expr_raw.strip()
     
-    # Must start with WHEN (case-insensitive)
-    if not condition_segment.lower().startswith("when"):
-        return None
+    if not condition_expr_raw:
+        return {"valid": False, "logic": None, "clauses": [], "original": ""}
     
-    # Remove WHEN prefix and trim
-    after_when = condition_segment[4:].strip()
-    if not after_when:
-        return None
+    expr_str = condition_expr_raw.strip()
     
-    # Use regex to match: ColumnName contains "Text"
-    # Pattern: column name (alphanumeric, spaces, underscores, hyphens), then "contains", then quoted string
-    pattern = r'^([A-Za-z0-9 _-]+)\s+contains\s+"([^"]+)"$'
-    match = re.match(pattern, after_when, re.IGNORECASE)
+    # Determine operator: AND, OR, or None (single clause)
+    has_and = re.search(r'\bAND\b', expr_str, re.IGNORECASE)
+    has_or = re.search(r'\bOR\b', expr_str, re.IGNORECASE)
     
-    if not match:
-        return None
+    if has_and and has_or:
+        # Mixed AND/OR - invalid
+        print(f"[RECIPE][AI][ERROR] Invalid mixed AND/OR in condition: {expr_str}")
+        return {"valid": False, "logic": "MIXED", "clauses": [], "original": expr_str}
     
-    column_name = match.group(1).strip()
-    substring = match.group(2).strip()
+    # Determine operator token
+    if has_and:
+        operator = "AND"
+        # Split on word boundary AND
+        clauses_raw = re.split(r'\bAND\b', expr_str, flags=re.IGNORECASE)
+    elif has_or:
+        operator = "OR"
+        # Split on word boundary OR
+        clauses_raw = re.split(r'\bOR\b', expr_str, flags=re.IGNORECASE)
+    else:
+        operator = None
+        clauses_raw = [expr_str]
     
-    if not column_name or not substring:
-        return None
+    # Clean up clause strings
+    clauses_raw = [c.strip() for c in clauses_raw if c.strip()]
+    
+    if not clauses_raw:
+        return {"valid": False, "logic": operator, "clauses": [], "original": expr_str}
+    
+    # Parse each clause
+    parsed_clauses = []
+    for clause_raw in clauses_raw:
+        clause_raw = clause_raw.strip()
+        
+        # Try: {ColumnName} contains "Text"
+        contains_match = re.match(r'^\{([^}]+)\}\s+contains\s+"([^"]+)"$', clause_raw, re.IGNORECASE)
+        if contains_match:
+            column = contains_match.group(1).strip()
+            value = contains_match.group(2)
+            parsed_clauses.append({"column": column, "op": "contains", "value": value})
+            continue
+        
+        # Try: {ColumnName} blank
+        blank_match = re.match(r'^\{([^}]+)\}\s+blank$', clause_raw, re.IGNORECASE)
+        if blank_match:
+            column = blank_match.group(1).strip()
+            parsed_clauses.append({"column": column, "op": "blank"})
+            continue
+        
+        # Try: {ColumnName} not blank
+        not_blank_match = re.match(r'^\{([^}]+)\}\s+not\s+blank$', clause_raw, re.IGNORECASE)
+        if not_blank_match:
+            column = not_blank_match.group(1).strip()
+            parsed_clauses.append({"column": column, "op": "not_blank"})
+            continue
+        
+        # Invalid clause
+        print(f"[RECIPE][AI][ERROR] Invalid condition clause: {clause_raw}")
+        return {"valid": False, "logic": operator, "clauses": [], "original": expr_str}
     
     return {
-        "column_name": column_name,
-        "substring": substring
+        "valid": True,
+        "logic": operator,
+        "clauses": parsed_clauses,
+        "original": expr_str
     }
 
 
 def _parse_ai_task(task_text: str) -> Optional[Dict[str, Any]]:
     """
-    Parse AI task pattern with optional WHEN condition.
+    Parse AI task pattern with new DSL format.
     
-    Supports two formats:
-    1. Unconditional: 'AI - (InputSheet, OutputSheet, OutputColumn, Model) """<PromptText>"""'
-    2. Conditional: 'AI - (InputSheet, OutputSheet, OutputColumn, Model) WHEN ColumnName contains "Text" """<PromptText>"""'
+    Format: 'AI - (InputSheet, OutputSheet, OutputColumn, Model[, ConditionExpression]) - PROMPT: <prompt text>'
     
     Syntax examples:
         Example 1 (unconditional):
-            AI - (Contacts output, Contacts output, GPT_Title, openai/gpt-4o-mini) \"\"\"
+            AI - (Contacts output, Contacts output, AI Title, gpt-4o-mini) - PROMPT:
             Summarize the job title in one sentence.
             Company: {Company}
-            \"\"\"
         
         Example 2 (conditional):
-            AI - (Contacts output, Contacts output, GPT_Situational, openai/gpt-4o-mini) WHEN Title contains "manager" \"\"\"
+            AI - (Contacts output, Contacts output, AI Director Summary, gpt-4o-mini, {Title} contains "Director") - PROMPT:
             Summarize the job title in one sentence.
             Company: {Company}
-            \"\"\"
     
     Returns:
-        Dict with 'input_sheet', 'output_sheet', 'output_column', 'model', 'prompt_template',
-        'condition_column' (None or str), 'condition_substring' (None or str),
+        Dict with 'input_sheet', 'output_sheet', 'output_column', 'model', 'prompt',
+        'condition' (None or parsed condition dict),
         or None if parse fails
     """
-    # Check if task text starts with "AI -" (case-insensitive)
-    if not task_text.lower().startswith("ai -"):
+    # Check if task text starts with "AI" (case-insensitive) and contains "- PROMPT:"
+    task_lower = task_text.lower()
+    if not task_lower.startswith("ai") or "- prompt:" not in task_lower:
         return None
     
-    # Find the first line up to the starting """
-    # The DSL line may be on the first line, and the prompt may start on the same or next line
-    first_triple_quote = task_text.find('"""')
-    if first_triple_quote == -1:
-        return None  # No triple quotes found
-    
-    # Extract the DSL line (everything before the first """)
-    dsl_line = task_text[:first_triple_quote].strip()
-    
-    # Remove "AI -" prefix
-    prefix_len = len("AI -")
-    if len(dsl_line) < prefix_len:
+    # Split on "- PROMPT:" (case-sensitive)
+    parts = task_text.split("- PROMPT:", 1)
+    if len(parts) != 2:
         return None
     
-    rest = dsl_line[prefix_len:].strip()
-    if not rest:
+    header = parts[0].strip()
+    prompt_text_raw = parts[1]
+    
+    # Extract the inner tuple from header
+    # Pattern: AI - (content)
+    match = re.match(r'^AI\s*-\s*\((.*)\)\s*$', header, re.IGNORECASE)
+    if not match:
         return None
     
-    # Extract the parenthesized section after "AI -"
-    # Pattern: (content) with optional WHEN clause before triple quotes
-    # First, find the closing parenthesis
-    if not rest.startswith("("):
+    inner = match.group(1).strip()
+    if not inner:
         return None
     
-    paren_end = rest.find(")")
-    if paren_end == -1:
+    # Split inner on commas at top level
+    parts_list = [p.strip() for p in inner.split(",") if p.strip()]
+    
+    # Must have 4 or 5 parts
+    if len(parts_list) not in (4, 5):
         return None
     
-    inner = rest[1:paren_end].strip()
-    after_parens = rest[paren_end + 1:].strip()
+    input_sheet = parts_list[0]
+    output_sheet = parts_list[1]
+    output_column = parts_list[2]
+    model = parts_list[3]
     
-    # Split inner content on commas
-    parts = [p.strip() for p in inner.split(",")]
-    
-    # Expect exactly 4 parts
-    if len(parts) != 4:
-        return None
-    
-    input_sheet = parts[0]
-    output_sheet = parts[1]
-    output_column = parts[2]
-    model = parts[3]
-    
-    # Validate that none are empty
+    # Validate that required fields are non-empty
     if not input_sheet or not output_sheet or not output_column or not model:
         return None
     
-    # Parse optional WHEN clause
-    condition_column = None
-    condition_substring = None
+    # Parse optional condition expression
+    condition = None
+    if len(parts_list) == 5:
+        condition_expr_raw = parts_list[4]
+        if condition_expr_raw.strip():
+            condition = _parse_ai_condition(condition_expr_raw)
     
-    if after_parens:
-        # Must start with WHEN if there's any text after parentheses
-        if not after_parens.lower().startswith("when"):
-            return None  # Unexpected text after parentheses
-        
-        condition = _parse_ai_condition(after_parens)
-        if condition is not None:
-            condition_column = condition["column_name"]
-            condition_substring = condition["substring"]
-        else:
-            # Invalid condition syntax
-            return None
-    
-    # Extract prompt template
-    # Find the first """ and the matching closing """
-    last_triple_quote = task_text.rfind('"""')
-    if last_triple_quote == -1 or last_triple_quote <= first_triple_quote:
-        return None  # Invalid triple quote structure
-    
-    prompt_with_quotes = task_text[first_triple_quote:last_triple_quote + 3].strip()
-    
-    if not prompt_with_quotes.startswith('"""') or not prompt_with_quotes.endswith('"""'):
-        return None
-    
-    prompt_template = prompt_with_quotes[3:-3]  # Remove first and last 3 characters (""")
+    # Extract prompt text (strip leading newlines/carriage returns, preserve internal newlines)
+    prompt_text = prompt_text_raw.lstrip('\n\r')
     
     result = {
         "input_sheet": input_sheet,
         "output_sheet": output_sheet,
         "output_column": output_column,
         "model": model,
-        "condition_column": condition_column,
-        "condition_substring": condition_substring,
-        "prompt_template": prompt_template,
+        "condition": condition,
+        "prompt": prompt_text,
     }
     
     return result
@@ -1168,9 +1178,8 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         output_sheet = params.get("output_sheet")
         output_column = params.get("output_column")
         model = params.get("model")
-        prompt_template = params.get("prompt_template")
-        condition_column = params.get("condition_column")
-        condition_substring = params.get("condition_substring")
+        prompt = params.get("prompt")
+        condition = params.get("condition")
         
         # Validate that all required fields are non-empty
         if not input_sheet:
@@ -1181,18 +1190,14 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
             return f"Row {row_index}: AI task output_column is required"
         if not model:
             return f"Row {row_index}: AI task model is required"
-        if not prompt_template:
-            return f"Row {row_index}: AI task prompt_template is required"
+        if not prompt:
+            return f"Row {row_index}: AI task prompt is required"
         
-        # Validate condition: either both None (unconditional) or both non-empty (conditional)
-        if (condition_column is None) != (condition_substring is None):
-            return f"Row {row_index}: AI task condition_column and condition_substring must both be present or both be absent"
-        
-        if condition_column is not None and not condition_column:
-            return f"Row {row_index}: AI task condition_column must be non-empty when condition is present"
-        
-        if condition_substring is not None and not condition_substring:
-            return f"Row {row_index}: AI task condition_substring must be non-empty when condition is present"
+        # Validate condition if present
+        if condition is not None:
+            if not condition.get("valid", False) or condition.get("logic") == "MIXED" or not condition.get("clauses"):
+                original_expr = condition.get("original", "unknown")
+                return f"Row {row_index}: AI task invalid ConditionExpression: {original_expr}"
     
     elif task_type == TASK_EXA:
         sheet = params.get("sheet")
@@ -2645,15 +2650,76 @@ async def _call_ai_with_retry(
     return None
 
 
+def _evaluate_ai_condition(condition: Optional[Dict[str, Any]], row: Dict[str, Any]) -> bool:
+    """
+    Evaluate an AI condition against a row.
+    
+    Args:
+        condition: Parsed condition dict (None, or dict with 'valid', 'logic', 'clauses')
+        row: Row data dict
+        
+    Returns:
+        True if condition is None (no filtering) or if condition evaluates to True.
+        False if condition is invalid or evaluates to False.
+    """
+    if condition is None:
+        return True  # No condition: process all rows
+    
+    if not condition.get("valid", False):
+        return False  # Invalid condition: skip row
+    
+    clauses = condition.get("clauses", [])
+    if not clauses:
+        return False  # No clauses: skip row
+    
+    logic = condition.get("logic")
+    
+    # Evaluate each clause
+    clause_results = []
+    for clause in clauses:
+        column = clause.get("column")
+        op = clause.get("op")
+        
+        # Get column value from row
+        value_raw = row.get(column)
+        value_str = "" if value_raw is None else str(value_raw).strip()
+        
+        # Evaluate clause based on operation
+        if op == "contains":
+            value_to_check = clause.get("value", "").lower()
+            clause_result = value_to_check in value_str.lower()
+        elif op == "blank":
+            clause_result = (value_str == "")
+        elif op == "not_blank":
+            clause_result = (value_str != "")
+        else:
+            clause_result = False  # Unknown operation
+        
+        clause_results.append(clause_result)
+    
+    # Combine clause results based on logic
+    if logic is None:
+        # Single clause: return its result
+        return clause_results[0] if clause_results else False
+    elif logic == "AND":
+        # All clauses must be True
+        return all(clause_results)
+    elif logic == "OR":
+        # At least one clause must be True
+        return any(clause_results)
+    else:
+        # Unknown logic (shouldn't happen if condition is valid)
+        return False
+
+
 async def run_ai_task(
     work: Dict[str, List[Dict[str, Any]]],
     input_sheet: str,
     output_sheet: str,
     output_column: str,
     model: str,
-    prompt_template: str,
-    condition_column: Optional[str],
-    condition_substring: Optional[str],
+    prompt: str,
+    condition: Optional[Dict[str, Any]],
     errors: List[str],
     ai_client: AsyncOpenAI,
     semaphore: asyncio.Semaphore,
@@ -2675,10 +2741,11 @@ async def run_ai_task(
         output_sheet: Name of output sheet
         output_column: Name of column to write results to
         model: Model identifier string (e.g., "openai/gpt-4o-mini")
-        prompt_template: Prompt template with {ColumnName} placeholders
-        condition_column: Optional column name for WHEN condition
-        condition_substring: Optional substring for WHEN condition
+        prompt: Prompt template with {ColumnName} placeholders
+        condition: Optional parsed condition dict
         errors: List to append error messages to
+        ai_client: AsyncOpenAI client instance
+        semaphore: Semaphore to limit concurrent AI requests
     """
     # Validate sheet existence
     if input_sheet not in work:
@@ -2730,28 +2797,9 @@ async def run_ai_task(
     
     # Log start
     condition_info = ""
-    if condition_column and condition_substring:
-        condition_info = f", condition_column='{condition_column}', condition_substring='{condition_substring}'"
-    print(f"[RECIPE][AI] input_sheet='{input_sheet}', output_sheet='{output_sheet}', output_column='{output_column}', model='{model}', total_rows={total_rows}{condition_info}")
-    
-    # Helper function to evaluate condition for a row
-    def evaluate_condition(row: Dict[str, Any]) -> bool:
-        """
-        Evaluate the condition for a row.
-        
-        Returns:
-            True if condition is None (unconditional) or if condition evaluates to True.
-            False if condition evaluates to False.
-        """
-        if condition_column is None or condition_substring is None:
-            return True  # Unconditional: process all rows
-        
-        # Get condition column value
-        cond_raw = row.get(condition_column, "")
-        cond_str = str(cond_raw).strip()
-        
-        # Case-insensitive contains check
-        return condition_substring.lower() in cond_str.lower()
+    if condition:
+        condition_info = f", condition present"
+    print(f"[RECIPE][AI] Starting AI task: input_sheet='{input_sheet}', output_sheet='{output_sheet}', output_column='{output_column}', model='{model}', total_rows={total_rows}{condition_info}")
     
     # Build prompts for each row
     async def process_row(row_index: int, in_row: Dict[str, Any], out_row: Dict[str, Any]) -> None:
@@ -2764,11 +2812,13 @@ async def run_ai_task(
             out_str = str(out_raw).strip()
             if out_str != "":
                 # Already filled, skip (idempotence)
+                print(f"[RECIPE][AI] Skipping row {row_index+2} in sheet '{output_sheet}' because output column '{output_column}' is already filled.")
                 return
             
             # 2. Check condition: if condition is false, skip this row
-            if not evaluate_condition(in_row):
+            if not _evaluate_ai_condition(condition, in_row):
                 # Condition is false: skip this row, leave output cell unchanged
+                print(f"[RECIPE][AI] Skipping row {row_index+2} due to condition not met.")
                 return
             
             # Row is eligible for processing
@@ -2784,20 +2834,20 @@ async def run_ai_task(
             # 4. Substitute placeholders in prompt template
             # Pattern: {ColumnName} where ColumnName matches a column header exactly
             # If a column is referenced but doesn't exist, substitute empty string
-            prompt = prompt_template
+            prompt_text = prompt
             
             # Find all placeholders in the prompt (pattern: {ColumnName})
             placeholder_pattern = r'\{([^}]+)\}'
-            placeholders = re.findall(placeholder_pattern, prompt)
+            placeholders = re.findall(placeholder_pattern, prompt_text)
             
             # Replace each placeholder with the corresponding value (or empty string if not found)
             for placeholder_name in placeholders:
                 value = variables.get(placeholder_name, "")
-                prompt = prompt.replace(f"{{{placeholder_name}}}", value)
+                prompt_text = prompt_text.replace(f"{{{placeholder_name}}}", value)
             
             # 5. Call AI with semaphore for concurrency control
             async with semaphore:
-                ai_response = await _call_ai_with_retry(ai_client, prompt, mapped_model)
+                ai_response = await _call_ai_with_retry(ai_client, prompt_text, mapped_model)
             
             # 6. Write result to output column
             if ai_response is None:
@@ -3367,9 +3417,8 @@ def run_recipe(project_id: str,
                         task.params["output_sheet"],
                         task.params["output_column"],
                         task.params["model"],
-                        task.params["prompt_template"],
-                        task.params.get("condition_column"),
-                        task.params.get("condition_substring"),
+                        task.params["prompt"],
+                        task.params.get("condition"),
                         errors,
                         ai_client,
                         ai_semaphore,
