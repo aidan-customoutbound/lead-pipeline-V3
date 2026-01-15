@@ -11,7 +11,7 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from api_server import get_supabase_client
