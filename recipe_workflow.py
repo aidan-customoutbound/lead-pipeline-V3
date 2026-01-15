@@ -390,65 +390,54 @@ def _parse_remove_characters(task_name: str) -> Optional[Dict[str, Any]]:
 
 def _parse_remove_text(task_name: str) -> Optional[Dict[str, Any]]:
     """
-    Parse 'Remove text - <SheetName> | <ColumnName> | "<Phrase1>" | "<Phrase2>" | ...' pattern.
+    Parse 'Remove text - (SheetName, ColumnName, Phrase1 | Phrase2 | Phrase3 | ...)' pattern.
     
     Syntax examples:
-        Remove text - URLs output | Company Name | "LLC" | "Inc." | "Corporation"
-        Remove text - Contacts output | Title | " at {Company}" | " (Remote)" | " (Contract)"
+        Remove text - (Contacts output, Company Name, LLC | Inc. | Corporation | Corp.)
+        Remove text - (Contacts output, Company Name, "LLC" | "Inc." | "Corporation")
+        Remove text - (Contacts output, Title, Sr. | Jr. | III)
     
     Returns:
-        Dict with 'sheet_name', 'column_name', and 'phrases' (list[str]) keys, or None if parse fails
+        Dict with 'sheet', 'column', and 'phrases' (list[str]) keys, or None if parse fails
     """
-    # Check if task name starts with "Remove text -" (case-insensitive)
-    if not task_name.lower().startswith("remove text -"):
+    # Pattern: Remove text - (SheetName, ColumnName, Phrase1 | Phrase2 | Phrase3 | ...)
+    pattern = r'^Remove text\s*-\s*\(([^,]+),\s*([^,]+),\s*(.+)\)$'
+    match = re.match(pattern, task_name, re.IGNORECASE)
+    if not match:
         return None
     
-    # Remove the prefix and trim
-    prefix_len = len("Remove text -")
-    rest = task_name[prefix_len:].strip()
+    sheet = match.group(1).strip()
+    column = match.group(2).strip()
+    phrases_raw = match.group(3).strip()
     
-    if not rest:
+    # Split on | and filter out empty parts
+    parts = [p.strip() for p in phrases_raw.split("|")]
+    parts = [p for p in parts if p]  # Filter out empty parts
+    
+    if not parts:
         return None
     
-    # Split by pipe character
-    tokens = [token.strip() for token in rest.split("|")]
-    
-    # Need at least 3 tokens: sheet_name, column_name, and at least one phrase
-    if len(tokens) < 3:
-        return None
-    
-    sheet_name = tokens[0]
-    column_name = tokens[1]
-    
-    # Validate that sheet_name and column_name are non-empty
-    if not sheet_name or not column_name:
-        return None
-    
-    # Parse phrases (tokens[2:] onwards)
-    phrases = []
-    for token in tokens[2:]:
-        if not token:
-            continue  # Skip empty tokens
-        
-        # Trim whitespace
-        phrase = token.strip()
-        
-        # Optionally strip surrounding double quotes if present
+    # Normalize quotes: strip surrounding single or double quotes if present
+    normalized_phrases = []
+    for p in parts:
+        phrase = p.strip()
+        # Check for double quotes
         if phrase.startswith('"') and phrase.endswith('"') and len(phrase) >= 2:
             phrase = phrase[1:-1].strip()
+        # Check for single quotes
+        elif phrase.startswith("'") and phrase.endswith("'") and len(phrase) >= 2:
+            phrase = phrase[1:-1].strip()
         
-        # Ignore empty phrases after trimming
-        if phrase:
-            phrases.append(phrase)
+        if phrase:  # Only add non-empty phrases after normalization
+            normalized_phrases.append(phrase)
     
-    # Must have at least one phrase
-    if not phrases:
+    if not normalized_phrases:
         return None
     
     return {
-        "sheet_name": sheet_name,
-        "column_name": column_name,
-        "phrases": phrases
+        "sheet": sheet,
+        "column": column,
+        "phrases": normalized_phrases,
     }
 
 
@@ -1063,17 +1052,20 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
                 return f"Row {row_index}: Concatenate task input columns must be non-empty strings"
     
     elif task_type == TASK_REMOVE_TEXT:
-        sheet_name = params.get("sheet_name")
-        column_name = params.get("column_name")
+        sheet = params.get("sheet")
+        column = params.get("column")
         phrases = params.get("phrases")
         
         # Validate that all required fields are non-empty
-        if not sheet_name:
-            return f"Row {row_index}: Remove text task sheet_name is required"
-        if not column_name:
-            return f"Row {row_index}: Remove text task column_name is required"
+        if not sheet or not isinstance(sheet, str) or not sheet.strip():
+            return f"Row {row_index}: Remove text task sheet is required"
+        if not column or not isinstance(column, str) or not column.strip():
+            return f"Row {row_index}: Remove text task column is required"
         if not phrases or not isinstance(phrases, list) or len(phrases) == 0:
             return f"Row {row_index}: Remove text task must have at least one phrase"
+        for phrase in phrases:
+            if not phrase or not isinstance(phrase, str) or not phrase.strip():
+                return f"Row {row_index}: Remove text task phrases must be non-empty strings"
     
     elif task_type in (TASK_FILTER_MATCH, TASK_FILTER_NOT_MATCH):
         source_sheet = params.get("source_sheet")
@@ -1427,7 +1419,7 @@ def _extract_referenced_sheets(tasks: List[RecipeTask]) -> set:
         elif task.type == TASK_REMOVE_CHARACTERS:
             referenced_sheets.add(params.get("sheet"))
         elif task.type == TASK_REMOVE_TEXT:
-            referenced_sheets.add(params.get("sheet_name"))
+            referenced_sheets.add(params.get("sheet"))
         elif task.type == TASK_CONCATENATE:
             referenced_sheets.add(params.get("sheet"))
         elif task.type == TASK_MAP:
@@ -1935,47 +1927,62 @@ def remove_characters(work: Dict[str, List[Dict[str, Any]]],
         row[column] = cleaned
 
 
-def remove_text_task(work: Dict[str, List[Dict[str, Any]]],
-                     sheet_name: str,
-                     column_name: str,
-                     phrases: List[str]) -> None:
+def remove_text(
+        work: Dict[str, List[Dict[str, Any]]],
+        sheet: str,
+        column: str,
+        phrases: List[str],
+        errors: List[str],
+    ) -> None:
     """
     Remove specific phrases (substrings) from a column in-place, case-insensitively.
     
     For each row in the sheet, removes all case-insensitive occurrences of each phrase
     from the column value, then writes the cleaned value back into the same column.
-    After removal, trims whitespace and optionally collapses multiple spaces.
+    After removal, normalizes whitespace (collapses multiple spaces, strips leading/trailing).
     
     Examples:
         - Input: "Acme LLC" with phrases=["LLC"] → Output: "Acme"
-        - Input: "Head of Growth at {Company}" with phrases=[" at {Company}"] → Output: "Head of Growth"
-        - Input: "Business Business LLC" with phrases=["Business", "LLC"] → Output: "" (empty after trimming)
+        - Input: "BigCo Inc." with phrases=["Inc."] → Output: "BigCo"
+        - Input: "ACME llc" with phrases=["llc"] → Output: "ACME"
     
     Args:
         work: Dictionary mapping sheet names to their row lists (mutated)
-        sheet_name: Name of sheet in work
-        column_name: Column name to clean (modified in-place)
+        sheet: Name of sheet in work
+        column: Column name to clean (modified in-place)
         phrases: List of phrase strings to remove (case-insensitive)
+        errors: List to append error messages to
         
     Note:
-        If sheet or column doesn't exist, the function returns early without modifying data.
-        This matches the behavior of other tasks that handle missing columns gracefully.
+        If sheet or column doesn't exist, logs error and appends to errors list.
+        Does not modify work if sheet/column is missing.
     """
-    # Look up the sheet
-    rows = work.get(sheet_name)
-    if rows is None:
-        # Sheet not found - return early without crashing
+    # Check sheet
+    if sheet not in work:
+        error_msg = f"Remove text: sheet '{sheet}' not found"
+        print(f"[RECIPE][REMOVE_TEXT][ERROR] sheet='{sheet}' not found; available sheets={list(work.keys())}")
+        errors.append(error_msg)
         return
     
-    # Ensure the column exists (check if it appears in any row)
-    if len(rows) > 0:
-        column_exists = any(column_name in row for row in rows)
-        if not column_exists:
-            # Column not found - return early without crashing
-            return
+    # Retrieve rows
+    rows = work[sheet]
+    
+    if not rows:
+        print(f"[RECIPE][REMOVE_TEXT] sheet='{sheet}' has no rows; nothing to clean")
+        return
+    
+    # Check column presence
+    column_exists = any(column in row for row in rows)
+    if not column_exists:
+        error_msg = f"Remove text: column '{column}' not found in sheet '{sheet}'"
+        print(f"[RECIPE][REMOVE_TEXT][ERROR] column='{column}' not found in any rows of sheet='{sheet}'")
+        errors.append(error_msg)
+        return
+    
+    # Log start
+    print(f"[RECIPE][REMOVE_TEXT] sheet='{sheet}', column='{column}', phrases={phrases}, row_count={len(rows)}")
     
     # Precompile regex patterns for case-insensitive phrase removal
-    # We'll use re.IGNORECASE flag for each phrase
     phrase_patterns = []
     for phrase in phrases:
         if phrase:  # Skip empty phrases (shouldn't happen after validation, but be safe)
@@ -1987,34 +1994,36 @@ def remove_text_task(work: Dict[str, List[Dict[str, Any]]],
     
     # Process each row
     for row in rows:
-        original_value = row.get(column_name)
+        raw_value = row.get(column, "")
         
-        # Convert to string and trim leading/trailing whitespace
-        if original_value is None:
-            original_value = ""
+        # If value is None or missing, treat as empty string
+        if raw_value is None:
+            text = ""
         else:
-            original_value = str(original_value).strip()
+            text = str(raw_value)
         
-        # If empty after trimming, skip heavy phrase removal
-        if not original_value:
-            row[column_name] = ""
-            continue
-        
-        # Apply all phrase removals
-        cleaned_value = original_value
+        # For each phrase in the phrase list
         for pattern in phrase_patterns:
-            # Remove all occurrences of this phrase (case-insensitive)
-            cleaned_value = pattern.sub('', cleaned_value)
+            # Remove all occurrences of that phrase from the text, case-insensitively
+            text = pattern.sub('', text)
         
-        # Optionally collapse multiple spaces into one
-        # Replace 2+ spaces with a single space
-        cleaned_value = re.sub(r' +', ' ', cleaned_value)
+        # After all phrases are removed:
+        # Normalize whitespace: replace sequences of whitespace with a single space
+        text = re.sub(r'\s+', ' ', text)
         
-        # Trim leading/trailing whitespace again after removals
-        cleaned_value = cleaned_value.strip()
+        # Strip leading and trailing whitespace
+        text = text.strip()
         
-        # Write back to the same column
-        row[column_name] = cleaned_value
+        # If the resulting string is empty, store ""
+        if not text:
+            text = ""
+        
+        # Write the cleaned string back into the same ColumnName for that row
+        row[column] = text
+    
+    # Assign back and log
+    work[sheet] = rows
+    print(f"[RECIPE][REMOVE_TEXT] completed sheet='{sheet}', column='{column}', rows_updated={len(rows)}")
 
 
 def concatenate(
@@ -3232,11 +3241,12 @@ def run_recipe(project_id: str,
                     task.params["characters_to_remove"]
                 )
             elif task.type == TASK_REMOVE_TEXT:
-                remove_text_task(
+                remove_text(
                     work,
-                    task.params["sheet_name"],
-                    task.params["column_name"],
-                    task.params["phrases"]
+                    task.params["sheet"],
+                    task.params["column"],
+                    task.params["phrases"],
+                    errors,
                 )
             elif task.type == TASK_CONCATENATE:
                 concatenate(
