@@ -766,10 +766,10 @@ def _parse_exa_condition(condition_segment: str) -> Optional[Dict[str, str]]:
 
 def _parse_ai_condition(condition_segment: str) -> Optional[Dict[str, str]]:
     """
-    Parse a WHEN condition segment: 'WHEN {ColumnName} contains: "Some Text"'
+    Parse a WHEN condition segment: 'WHEN ColumnName contains "Text"'
     
     Args:
-        condition_segment: The condition segment string (e.g., 'WHEN {Segment} contains: "B2B"')
+        condition_segment: The condition segment string (e.g., 'WHEN Title contains "manager"')
         
     Returns:
         Dict with 'column_name' and 'substring' keys, or None if parse fails
@@ -785,42 +785,19 @@ def _parse_ai_condition(condition_segment: str) -> Optional[Dict[str, str]]:
     if not after_when:
         return None
     
-    # Expect placeholder {ColumnName}
-    if not after_when.startswith("{") or "}" not in after_when:
+    # Use regex to match: ColumnName contains "Text"
+    # Pattern: column name (alphanumeric, spaces, underscores, hyphens), then "contains", then quoted string
+    pattern = r'^([A-Za-z0-9 _-]+)\s+contains\s+"([^"]+)"$'
+    match = re.match(pattern, after_when, re.IGNORECASE)
+    
+    if not match:
         return None
     
-    # Extract column name from placeholder
-    placeholder_end = after_when.find("}")
-    if placeholder_end == -1:
-        return None
+    column_name = match.group(1).strip()
+    substring = match.group(2).strip()
     
-    column_name = after_when[1:placeholder_end].strip()
-    if not column_name:
+    if not column_name or not substring:
         return None
-    
-    # After placeholder, expect space and "contains:" (case-insensitive)
-    after_placeholder = after_when[placeholder_end + 1:].strip()
-    after_placeholder_lower = after_placeholder.lower()
-    if not after_placeholder_lower.startswith("contains:"):
-        return None
-    
-    # Find the position of "contains:" in the original string (case-insensitive)
-    # We know it starts at position 0 after trimming, so find the length
-    contains_len = len("contains:")
-    # Remove "contains:" prefix and trim (use the actual substring from original)
-    after_contains = after_placeholder[contains_len:].strip()
-    if not after_contains:
-        return None
-    
-    # Expect quoted string
-    if not after_contains.startswith('"') or not after_contains.endswith('"'):
-        return None
-    
-    if len(after_contains) < 2:
-        return None
-    
-    # Extract substring from quotes
-    substring = after_contains[1:-1].strip()
     
     return {
         "column_name": column_name,
@@ -828,112 +805,122 @@ def _parse_ai_condition(condition_segment: str) -> Optional[Dict[str, str]]:
     }
 
 
-def _parse_ai_task(task_name: str) -> Optional[Dict[str, Any]]:
+def _parse_ai_task(task_text: str) -> Optional[Dict[str, Any]]:
     """
     Parse AI task pattern with optional WHEN condition.
     
     Supports two formats:
-    1. Unconditional: 'AI - <InputSheet> | <OutputSheet> | <OutputColumn> | <ModelName> | """<PromptText>"""'
-    2. Conditional: 'AI - <InputSheet> | <OutputSheet> | <OutputColumn> | <ModelName> | WHEN {ColumnName} contains: "Text" | """<PromptText>"""'
+    1. Unconditional: 'AI - (InputSheet, OutputSheet, OutputColumn, Model) """<PromptText>"""'
+    2. Conditional: 'AI - (InputSheet, OutputSheet, OutputColumn, Model) WHEN ColumnName contains "Text" """<PromptText>"""'
     
     Syntax examples:
         Example 1 (unconditional):
-            AI - URLs output | URLs output | GPT_Company_Summary | gpt-mini | \"\"\"
-            #Summarize what this company does in one sentence.
-            
-            #Company: {Company}
-            #Website: {Website}
-            #Short description: {Short Description}
-            
-            #Return a single plain-English sentence with no fluff.
+            AI - (Contacts output, Contacts output, GPT_Title, openai/gpt-4o-mini) \"\"\"
+            Summarize the job title in one sentence.
+            Company: {Company}
             \"\"\"
         
         Example 2 (conditional):
-            AI - URLs output | URLs output | GPT_Company_Summary | gpt-mini | WHEN {Segment} contains: "B2B" | \"\"\"
-            #Summarize what this company does in one sentence.
-            
-            #Company: {Company}
-            #Website: {Website}
-            #Short description: {Short Description}
-            
-            #Return a single plain-English sentence with no fluff.
+            AI - (Contacts output, Contacts output, GPT_Situational, openai/gpt-4o-mini) WHEN Title contains "manager" \"\"\"
+            Summarize the job title in one sentence.
+            Company: {Company}
             \"\"\"
     
     Returns:
-        Dict with 'input_sheet_name', 'output_sheet_name', 'output_column_name', 'model_name', 'prompt_template',
-        and optionally 'condition' (None if unconditional, or dict with 'column_name' and 'substring' if conditional),
+        Dict with 'input_sheet', 'output_sheet', 'output_column', 'model', 'prompt_template',
+        'condition_column' (None or str), 'condition_substring' (None or str),
         or None if parse fails
     """
-    # Check if task name starts with "AI -" (case-insensitive)
-    if not task_name.lower().startswith("ai -"):
+    # Check if task text starts with "AI -" (case-insensitive)
+    if not task_text.lower().startswith("ai -"):
         return None
     
-    # Remove the prefix and trim
-    prefix_len = len("AI -")
-    rest = task_name[prefix_len:].strip()
-    
-    if not rest:
-        return None
-    
-    # Split by pipe character - but we need to be careful because the prompt may contain pipes
-    # The prompt is wrapped in triple quotes, so we can find the last token by looking for triple quotes
-    # Strategy: split on |, but the last token should contain the prompt with triple quotes
-    
-    # Find the position of the first triple quote
-    first_triple_quote = rest.find('"""')
+    # Find the first line up to the starting """
+    # The DSL line may be on the first line, and the prompt may start on the same or next line
+    first_triple_quote = task_text.find('"""')
     if first_triple_quote == -1:
         return None  # No triple quotes found
     
-    # Find the position of the last triple quote (must be after the first one)
-    last_triple_quote = rest.rfind('"""')
+    # Extract the DSL line (everything before the first """)
+    dsl_line = task_text[:first_triple_quote].strip()
+    
+    # Remove "AI -" prefix
+    prefix_len = len("AI -")
+    if len(dsl_line) < prefix_len:
+        return None
+    
+    rest = dsl_line[prefix_len:].strip()
+    if not rest:
+        return None
+    
+    # Extract the parenthesized section after "AI -"
+    # Pattern: (content) with optional WHEN clause before triple quotes
+    # First, find the closing parenthesis
+    if not rest.startswith("("):
+        return None
+    
+    paren_end = rest.find(")")
+    if paren_end == -1:
+        return None
+    
+    inner = rest[1:paren_end].strip()
+    after_parens = rest[paren_end + 1:].strip()
+    
+    # Split inner content on commas
+    parts = [p.strip() for p in inner.split(",")]
+    
+    # Expect exactly 4 parts
+    if len(parts) != 4:
+        return None
+    
+    input_sheet = parts[0]
+    output_sheet = parts[1]
+    output_column = parts[2]
+    model = parts[3]
+    
+    # Validate that none are empty
+    if not input_sheet or not output_sheet or not output_column or not model:
+        return None
+    
+    # Parse optional WHEN clause
+    condition_column = None
+    condition_substring = None
+    
+    if after_parens:
+        # Must start with WHEN if there's any text after parentheses
+        if not after_parens.lower().startswith("when"):
+            return None  # Unexpected text after parentheses
+        
+        condition = _parse_ai_condition(after_parens)
+        if condition is not None:
+            condition_column = condition["column_name"]
+            condition_substring = condition["substring"]
+        else:
+            # Invalid condition syntax
+            return None
+    
+    # Extract prompt template
+    # Find the first """ and the matching closing """
+    last_triple_quote = task_text.rfind('"""')
     if last_triple_quote == -1 or last_triple_quote <= first_triple_quote:
         return None  # Invalid triple quote structure
     
-    # Split the part before the prompt on |
-    before_prompt = rest[:first_triple_quote].strip()
-    prompt_with_quotes = rest[first_triple_quote:last_triple_quote + 3].strip()
+    prompt_with_quotes = task_text[first_triple_quote:last_triple_quote + 3].strip()
     
-    # Split before_prompt on |
-    tokens_before = [token.strip() for token in before_prompt.split("|")]
-    
-    # We expect either 4 tokens (unconditional) or 5 tokens (conditional) before the prompt
-    if len(tokens_before) not in (4, 5):
-        return None
-    
-    input_sheet_name = tokens_before[0]
-    output_sheet_name = tokens_before[1]
-    output_column_name = tokens_before[2]
-    model_name = tokens_before[3]
-    
-    # Validate that none are empty
-    if not input_sheet_name or not output_sheet_name or not output_column_name or not model_name:
-        return None
-    
-    # Parse condition if present (5 tokens = conditional)
-    condition = None
-    if len(tokens_before) == 5:
-        condition_segment = tokens_before[4]
-        condition = _parse_ai_condition(condition_segment)
-        if condition is None:
-            return None  # Invalid condition syntax
-    
-    # Extract prompt template by removing outer triple quotes
     if not prompt_with_quotes.startswith('"""') or not prompt_with_quotes.endswith('"""'):
         return None
     
     prompt_template = prompt_with_quotes[3:-3]  # Remove first and last 3 characters (""")
     
     result = {
-        "input_sheet_name": input_sheet_name,
-        "output_sheet_name": output_sheet_name,
-        "output_column_name": output_column_name,
-        "model_name": model_name,
-        "prompt_template": prompt_template
+        "input_sheet": input_sheet,
+        "output_sheet": output_sheet,
+        "output_column": output_column,
+        "model": model,
+        "condition_column": condition_column,
+        "condition_substring": condition_substring,
+        "prompt_template": prompt_template,
     }
-    
-    # Add condition if present
-    if condition is not None:
-        result["condition"] = condition
     
     return result
 
@@ -1167,36 +1154,35 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
             return f"Row {row_index}: Copy columns task must have at least one column mapping"
     
     elif task_type == TASK_AI:
-        input_sheet_name = params.get("input_sheet_name")
-        output_sheet_name = params.get("output_sheet_name")
-        output_column_name = params.get("output_column_name")
-        model_name = params.get("model_name")
+        input_sheet = params.get("input_sheet")
+        output_sheet = params.get("output_sheet")
+        output_column = params.get("output_column")
+        model = params.get("model")
         prompt_template = params.get("prompt_template")
-        condition = params.get("condition")
+        condition_column = params.get("condition_column")
+        condition_substring = params.get("condition_substring")
         
         # Validate that all required fields are non-empty
-        if not input_sheet_name:
-            return f"Row {row_index}: AI task input_sheet_name is required"
-        if not output_sheet_name:
-            return f"Row {row_index}: AI task output_sheet_name is required"
-        if not output_column_name:
-            return f"Row {row_index}: AI task output_column_name is required"
-        if not model_name:
-            return f"Row {row_index}: AI task model_name is required"
-        if prompt_template is None:
+        if not input_sheet:
+            return f"Row {row_index}: AI task input_sheet is required"
+        if not output_sheet:
+            return f"Row {row_index}: AI task output_sheet is required"
+        if not output_column:
+            return f"Row {row_index}: AI task output_column is required"
+        if not model:
+            return f"Row {row_index}: AI task model is required"
+        if not prompt_template:
             return f"Row {row_index}: AI task prompt_template is required"
         
-        # Validate condition if present
-        if condition is not None:
-            condition_column_name = condition.get("column_name")
-            if not condition_column_name:
-                return f"Row {row_index}: AI task condition column_name is required when condition is present"
-            # Note: We don't validate that the column exists at parse time,
-            # since sheet headers are validated at runtime when data is present
+        # Validate condition: either both None (unconditional) or both non-empty (conditional)
+        if (condition_column is None) != (condition_substring is None):
+            return f"Row {row_index}: AI task condition_column and condition_substring must both be present or both be absent"
         
-        # Input sheet must exist in inputs or work (we'll check at runtime if it's in work)
-        # Output sheet should be an output sheet (but we allow any sheet that exists)
-        # For now, we just validate they're non-empty strings
+        if condition_column is not None and not condition_column:
+            return f"Row {row_index}: AI task condition_column must be non-empty when condition is present"
+        
+        if condition_substring is not None and not condition_substring:
+            return f"Row {row_index}: AI task condition_substring must be non-empty when condition is present"
     
     elif task_type == TASK_EXA:
         sheet = params.get("sheet")
@@ -1446,8 +1432,8 @@ def _extract_referenced_sheets(tasks: List[RecipeTask]) -> set:
             referenced_sheets.add(params.get("source_sheet"))
             referenced_sheets.add(params.get("target_sheet"))
         elif task.type == TASK_AI:
-            referenced_sheets.add(params.get("input_sheet_name"))
-            referenced_sheets.add(params.get("output_sheet_name"))
+            referenced_sheets.add(params.get("input_sheet"))
+            referenced_sheets.add(params.get("output_sheet"))
         elif task.type == TASK_EXA:
             referenced_sheets.add(params.get("sheet"))
     
@@ -2636,55 +2622,59 @@ async def _call_ai_with_retry(
 
 async def run_ai_task(
     work: Dict[str, List[Dict[str, Any]]],
-    task: RecipeTask,
+    input_sheet: str,
+    output_sheet: str,
+    output_column: str,
+    model: str,
+    prompt_template: str,
+    condition_column: Optional[str],
+    condition_substring: Optional[str],
+    errors: List[str],
     ai_client: AsyncOpenAI,
-    semaphore: asyncio.Semaphore
+    semaphore: asyncio.Semaphore,
 ) -> None:
     """
     Execute an AI recipe task with optional conditional execution.
     
     This function:
-    1. Reads input sheet data
-    2. For each row, evaluates condition if present (skips row if condition is false)
-    3. Builds prompts for eligible rows by substituting {ColumnName} placeholders
-    4. Calls AI API with batching, concurrency limits, and retries
-    5. Writes results to output column in output sheet
+    1. Validates sheet existence
+    2. For each row, checks idempotence (skip if output cell is non-empty)
+    3. For each row, evaluates condition if present (skips row if condition is false)
+    4. Builds prompts for eligible rows by substituting {ColumnName} placeholders
+    5. Calls AI API with batching, concurrency limits, and retries
+    6. Writes results to output column in output sheet
     
     Args:
         work: Dictionary mapping sheet names to their row lists (mutated)
-        task: RecipeTask with type TASK_AI and params containing:
-            - input_sheet_name: Name of input sheet
-            - output_sheet_name: Name of output sheet
-            - output_column_name: Name of column to write results to
-            - model_name: Model name (will be mapped to OpenRouter identifier)
-            - prompt_template: Prompt template with {ColumnName} placeholders
-            - condition: Optional dict with 'column_name' and 'substring' for conditional execution
-        ai_client: AsyncOpenAI client configured for OpenRouter
-        semaphore: Semaphore to limit concurrent AI requests
-        
-    Raises:
-        ValueError: If input sheet is not found or other configuration errors
+        input_sheet: Name of input sheet
+        output_sheet: Name of output sheet
+        output_column: Name of column to write results to
+        model: Model identifier string (e.g., "openai/gpt-4o-mini")
+        prompt_template: Prompt template with {ColumnName} placeholders
+        condition_column: Optional column name for WHEN condition
+        condition_substring: Optional substring for WHEN condition
+        errors: List to append error messages to
     """
-    input_sheet_name = task.params["input_sheet_name"]
-    output_sheet_name = task.params["output_sheet_name"]
-    output_column_name = task.params["output_column_name"]
-    model_name = task.params["model_name"]
-    prompt_template = task.params["prompt_template"]
-    condition = task.params.get("condition")  # Optional condition
+    # Validate sheet existence
+    if input_sheet not in work:
+        error_msg = f"[RECIPE][AI][ERROR] input_sheet='{input_sheet}' not found; available_sheets={list(work.keys())}"
+        print(error_msg)
+        errors.append(error_msg)
+        return
     
-    # Resolve sheets
-    input_rows = work.get(input_sheet_name)
-    if input_rows is None:
-        raise ValueError(f"Input sheet '{input_sheet_name}' not found in work dictionary")
+    if output_sheet not in work:
+        error_msg = f"[RECIPE][AI][ERROR] output_sheet='{output_sheet}' not found; available_sheets={list(work.keys())}"
+        print(error_msg)
+        errors.append(error_msg)
+        return
     
-    output_rows = work.get(output_sheet_name)
-    if output_rows is None:
-        raise ValueError(f"Output sheet '{output_sheet_name}' not found in work dictionary")
+    input_rows = work[input_sheet]
+    output_rows = work[output_sheet]
     
     # Ensure row alignment: if input and output are different sheets,
     # we assume they have the same row ordering (row i in input corresponds to row i in output)
     # If they're the same sheet, they refer to the same list
-    if input_sheet_name == output_sheet_name:
+    if input_sheet == output_sheet:
         output_rows = input_rows
     else:
         # Ensure output_rows has at least as many rows as input_rows
@@ -2693,13 +2683,31 @@ async def run_ai_task(
             output_rows.append({})
     
     # Map model name to OpenRouter identifier
-    mapped_model = _map_model_name(model_name)
+    try:
+        mapped_model = _map_model_name(model)
+    except ValueError as e:
+        error_msg = f"[RECIPE][AI][ERROR] model='{model}' is invalid: {str(e)}"
+        print(error_msg)
+        errors.append(error_msg)
+        return
     
     # Determine column headers from first row (if available)
     # We'll use all keys in the row as potential column names
     column_headers = set()
     if len(input_rows) > 0:
         column_headers = set(input_rows[0].keys())
+    
+    # Track statistics
+    total_rows = len(input_rows)
+    eligible_count = 0
+    successful_count = 0
+    failed_count = 0
+    
+    # Log start
+    condition_info = ""
+    if condition_column and condition_substring:
+        condition_info = f", condition_column='{condition_column}', condition_substring='{condition_substring}'"
+    print(f"[RECIPE][AI] input_sheet='{input_sheet}', output_sheet='{output_sheet}', output_column='{output_column}', model='{model}', total_rows={total_rows}{condition_info}")
     
     # Helper function to evaluate condition for a row
     def evaluate_condition(row: Dict[str, Any]) -> bool:
@@ -2710,41 +2718,45 @@ async def run_ai_task(
             True if condition is None (unconditional) or if condition evaluates to True.
             False if condition evaluates to False.
         """
-        if condition is None:
+        if condition_column is None or condition_substring is None:
             return True  # Unconditional: process all rows
         
         # Get condition column value
-        condition_column_name = condition["column_name"]
-        condition_substring = condition["substring"]
-        
-        # Get value from row (stringified, trimmed)
-        row_value = row.get(condition_column_name)
-        if row_value is None:
-            row_value = ""
-        else:
-            row_value = str(row_value).strip()
+        cond_raw = row.get(condition_column, "")
+        cond_str = str(cond_raw).strip()
         
         # Case-insensitive contains check
-        return condition_substring.lower() in row_value.lower()
+        return condition_substring.lower() in cond_str.lower()
     
     # Build prompts for each row
-    async def process_row(row_index: int, row: Dict[str, Any]) -> None:
-        """Process a single row: check condition, build prompt, call AI, write result."""
+    async def process_row(row_index: int, in_row: Dict[str, Any], out_row: Dict[str, Any]) -> None:
+        """Process a single row: check idempotence, check condition, build prompt, call AI, write result."""
+        nonlocal eligible_count, successful_count, failed_count
+        
         try:
-            # Evaluate condition first - if false, skip this row entirely
-            if not evaluate_condition(row):
+            # 1. Check idempotence: if output cell is already non-empty, skip
+            out_raw = out_row.get(output_column, "")
+            out_str = str(out_raw).strip()
+            if out_str != "":
+                # Already filled, skip (idempotence)
+                return
+            
+            # 2. Check condition: if condition is false, skip this row
+            if not evaluate_condition(in_row):
                 # Condition is false: skip this row, leave output cell unchanged
                 return
             
-            # Condition is true (or no condition): proceed with AI processing
-            # Build row values dict (column name -> value)
-            row_values = {}
-            for col_name in column_headers:
-                value = row.get(col_name)
-                # Convert to string, handling None/empty
-                row_values[col_name] = str(value) if value is not None else ""
+            # Row is eligible for processing
+            eligible_count += 1
             
-            # Substitute placeholders in prompt template
+            # 3. Build row values dict (column name -> value) from input row
+            variables = {}
+            for col_name in column_headers:
+                value = in_row.get(col_name)
+                # Convert to string, handling None/empty
+                variables[col_name] = str(value) if value is not None else ""
+            
+            # 4. Substitute placeholders in prompt template
             # Pattern: {ColumnName} where ColumnName matches a column header exactly
             # If a column is referenced but doesn't exist, substitute empty string
             prompt = prompt_template
@@ -2755,44 +2767,48 @@ async def run_ai_task(
             
             # Replace each placeholder with the corresponding value (or empty string if not found)
             for placeholder_name in placeholders:
-                value = row_values.get(placeholder_name, "")
+                value = variables.get(placeholder_name, "")
                 prompt = prompt.replace(f"{{{placeholder_name}}}", value)
             
-            # Call AI with semaphore for concurrency control
+            # 5. Call AI with semaphore for concurrency control
             async with semaphore:
                 ai_response = await _call_ai_with_retry(ai_client, prompt, mapped_model)
             
-            # Write result to output column
-            # Ensure the output column exists in the row dict
-            # If AI call failed, write empty string (per spec: empty string on failure)
+            # 6. Write result to output column
             if ai_response is None:
-                output_rows[row_index][output_column_name] = ""
+                # AI call failed: leave output cell unchanged (likely empty)
+                failed_count += 1
+                error_msg = f"[RECIPE][AI][ERROR] Row {row_index}: AI call failed"
+                print(error_msg)
             else:
-                output_rows[row_index][output_column_name] = ai_response
+                out_row[output_column] = ai_response
+                successful_count += 1
         except Exception as e:
-            # Per-row error: write empty string and continue processing other rows
-            # This ensures one row failure doesn't crash the entire task
-            output_rows[row_index][output_column_name] = ""
-            # Note: We don't log here since we don't have a logger in this context
-            # The caller can handle logging if needed
+            # Per-row error: leave output cell unchanged (likely empty)
+            failed_count += 1
+            error_msg = f"[RECIPE][AI][ERROR] Row {row_index}: {str(e)}"
+            print(error_msg)
+            # Don't append to errors list for per-row errors to avoid spam
     
     # Process all rows concurrently (with semaphore limiting concurrency)
     # Batch processing: process in chunks to avoid overwhelming the system
-    # Note: Rows that don't pass the condition will be skipped in process_row
     batch_size = 50
     for batch_start in range(0, len(input_rows), batch_size):
         batch_end = min(batch_start + batch_size, len(input_rows))
-        batch_rows = input_rows[batch_start:batch_end]
         
         # Process batch concurrently
         tasks = [
-            process_row(batch_start + i, row)
-            for i, row in enumerate(batch_rows)
+            process_row(batch_start + i, input_rows[batch_start + i], output_rows[batch_start + i])
+            for i in range(batch_end - batch_start)
         ]
         
         await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Note: We continue even if some rows fail (exceptions are caught by gather)
+    
+    # Replace updated rows back into work (output_rows is already a reference, but ensure it's updated)
+    work[output_sheet] = output_rows
+    
+    # Log summary
+    print(f"[RECIPE][AI] completed input_sheet='{input_sheet}', output_sheet='{output_sheet}', model='{model}', total_rows={total_rows}, eligible={eligible_count}, successful={successful_count}, failed={failed_count}")
 
 
 async def _call_exa_with_retry(
@@ -3320,9 +3336,23 @@ def run_recipe(project_id: str,
                 # Note: asyncio.run() creates a new event loop, so this is safe even if
                 # called from a sync context (which is the case in worker.py)
                 try:
-                    asyncio.run(run_ai_task(work, task, ai_client, ai_semaphore))
+                    asyncio.run(run_ai_task(
+                        work,
+                        task.params["input_sheet"],
+                        task.params["output_sheet"],
+                        task.params["output_column"],
+                        task.params["model"],
+                        task.params["prompt_template"],
+                        task.params.get("condition_column"),
+                        task.params.get("condition_substring"),
+                        errors,
+                        ai_client,
+                        ai_semaphore,
+                    ))
                 except Exception as e:
-                    raise ValueError(f"AI task failed on row {task.row_index}: {str(e)}")
+                    error_msg = f"[RECIPE][AI][ERROR] AI task failed on row {task.row_index}: {str(e)}"
+                    print(error_msg)
+                    errors.append(error_msg)
             elif task.type == TASK_EXA:
                 # Exa tasks are async, so we need to run them in an event loop
                 # Since run_recipe is sync, we use asyncio.run()
