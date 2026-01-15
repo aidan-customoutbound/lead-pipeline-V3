@@ -2881,7 +2881,7 @@ async def run_exa_task(
     
     This function:
     1. Reads input sheet data
-    2. For each row, checks reference_column if provided (skips row if blank)
+    2. For each row, checks reference_column if provided (only runs when reference column IS blank)
     3. Checks if website is non-empty and output column is empty (idempotent)
     4. Calls Exa API with batching, concurrency limits, and retries
     5. Writes results to output column
@@ -2891,7 +2891,7 @@ async def run_exa_task(
         sheet: Name of sheet to process
         website_column: Name of column containing website URLs
         output_column: Name of column to write results to
-        reference_column: Optional column name; if provided, only process rows where this column is non-blank
+        reference_column: Optional column name; if provided, only process rows where this column IS blank
         exa_client: Exa client instance
         semaphore: Semaphore to limit concurrent Exa requests
         errors: List to append error messages to (mutated)
@@ -2899,14 +2899,15 @@ async def run_exa_task(
     # Resolve sheet
     rows = work.get(sheet)
     if rows is None:
-        error_msg = f"[RECIPE][EXA][ERROR] sheet='{sheet}' not found"
+        available_sheets = list(work.keys())
+        error_msg = f"[RECIPE][EXA][ERROR] sheet='{sheet}' not found; available_sheets={available_sheets}"
         print(error_msg)
         errors.append(error_msg)
         return
     
     # If rows is empty, log and return
     if len(rows) == 0:
-        print(f"[RECIPE][EXA] sheet='{sheet}' has no rows, returning without modification")
+        print(f"[RECIPE][EXA] sheet='{sheet}' has no rows; nothing to do")
         return
     
     # Ensure output_column exists in all rows
@@ -2931,8 +2932,8 @@ async def run_exa_task(
         if reference_column is not None:
             ref_raw = row.get(reference_column, "")
             ref_str = str(ref_raw).strip()
-            # Skip if reference column is empty
-            if not ref_str:
+            # Skip if reference column is NOT empty (we only run when it IS blank)
+            if ref_str:
                 continue
         
         # Check if output column already has a non-empty value (idempotent)
@@ -2952,7 +2953,7 @@ async def run_exa_task(
     print(f"[RECIPE][EXA] sheet='{sheet}', website_column='{website_column}', output_column='{output_column}'{ref_col_str}, total_rows={total_rows}, eligible_rows={eligible_count}")
     
     if eligible_count == 0:
-        print(f"[RECIPE][EXA] No eligible rows to process")
+        print(f"[RECIPE][EXA] sheet='{sheet}', website_column='{website_column}', output_column='{output_column}'{ref_col_str}, eligible_rows=0")
         return
     
     # Process each eligible row
@@ -3002,7 +3003,7 @@ async def run_exa_task(
         await asyncio.gather(*tasks, return_exceptions=True)
     
     # Log summary
-    print(f"[RECIPE][EXA] processed_rows={eligible_count}, successful={successful}, failed={failed}")
+    print(f"[RECIPE][EXA] completed sheet='{sheet}', eligible={eligible_count}, successful={successful}, failed={failed}")
 
 
 def run_recipe(project_id: str,
