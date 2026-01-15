@@ -2,7 +2,7 @@
 Worker process that polls for queued runs and processes them.
 
 This worker continuously polls the public.runs table for runs with status='queued',
-claims them atomically, and executes the enrichment workflow.
+claims them atomically, and executes the recipe workflow.
 """
 
 import asyncio
@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from api_server import get_supabase_client
 
-import enrich_workflow
 import recipe_workflow
 from sheet_export import (
     get_sheets_service,
@@ -114,7 +113,7 @@ def claim_next_run(supabase: Client) -> Optional[Dict[str, Any]]:
             # Another worker claimed it first, try again next iteration
             return None
         
-        log(f"Claimed run {run_id} for project {run['project_id']}, run_type={run.get('run_type', 'enrichment')}")
+        log(f"Claimed run {run_id} for project {run['project_id']}, run_type={run.get('run_type', 'recipe')}")
         return run
         
     except Exception as e:
@@ -132,7 +131,7 @@ def process_run(run_row, supabase):
     """
     run_id = run_row["id"]
     project_id = run_row["project_id"]
-    run_type = run_row.get("run_type") or "enrichment"
+    run_type = run_row.get("run_type") or "recipe"
     
     log(f"processing run {run_id} for project {project_id}, run_type={run_type}")
     
@@ -141,8 +140,8 @@ def process_run(run_row, supabase):
         log(f"Run {run_id} is no longer active, stopping processing")
         return
     
-    # Branch based on run_type
-    if run_type == "recipe":
+    # Only support recipe runs - enrichment workflow has been deprecated
+    if run_type == "recipe" or not run_type or run_type.strip() == "":
         # Recipe run: read from Sheets, run recipe_workflow, write results back
         log(f"[worker] Processing recipe run for run_id={run_id}, project={project_id}")
         
@@ -360,46 +359,21 @@ def process_run(run_row, supabase):
             
             log(f"Failed recipe run {run_id} for project {project_id}: {error_message}")
     else:
-        # Enrichment run (default): use existing enrichment workflow
+        # Unsupported run_type - mark as failed with clear error message
+        error_message = f"Unsupported run_type '{run_type}'. Enrichment workflow has been deprecated; use 'recipe' instead."
+        log(f"Rejecting run {run_id} with unsupported run_type: {run_type}")
+        
+        finished_at = datetime.utcnow()
         try:
-            # Run the enrichment workflow (pass run_id for active checks)
-            asyncio.run(enrich_workflow.run(project_id, run_id))
-            
-            # Check if run is still active before marking as completed
-            if not is_run_active(supabase, run_id):
-                log(f"Run {run_id} is no longer active, stopping before marking completed")
-                return
-            
-            # Update run to completed (only if still in 'running' status to prevent superseded runs from updating)
-            finished_at = datetime.utcnow()
             supabase.table("runs").update({
-                "status": "completed",
-                "finished_at": finished_at.isoformat()
+                "status": "failed",
+                "finished_at": finished_at.isoformat(),
+                "error_message": error_message
             }).eq("id", run_id).eq("status", "running").execute()
-            
-            log(f"Completed run {run_id} for project {project_id}")
-            
-        except Exception as e:
-            # Check if run is still active before marking as failed
-            if not is_run_active(supabase, run_id):
-                log(f"Run {run_id} is no longer active, stopping before marking failed")
-                return
-            
-            # Update run to failed (only if still in 'running' status to prevent superseded runs from updating)
-            finished_at = datetime.utcnow()
-            error_message = str(e)[:500]  # Truncate to first 500 chars
-            
-            try:
-                supabase.table("runs").update({
-                    "status": "failed",
-                    "finished_at": finished_at.isoformat(),
-                    "error_message": error_message
-                }).eq("id", run_id).eq("status", "running").execute()
-            except Exception as update_error:
-                log(f"Error updating run {run_id} to failed: {str(update_error)}")
-            
-            log(f"Failed run {run_id} for project {project_id}: {error_message}")
-            # Don't re-raise - let the worker continue processing other runs
+        except Exception as update_error:
+            log(f"Error updating run {run_id} to failed: {str(update_error)}")
+        
+        log(f"Marked run {run_id} as failed: {error_message}")
 
 
 async def main():

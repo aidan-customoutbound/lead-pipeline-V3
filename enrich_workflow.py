@@ -1,4 +1,12 @@
 """
+LEGACY: Enrichment workflow has been deprecated in favor of the Master sheet recipe engine.
+
+This module is no longer used in the runtime codebase. All AI + Exa behavior is now
+controlled by the Master sheet DSL and recipe_workflow.py.
+
+This file is kept for reference only and should not be imported or called by any
+runtime code paths.
+
 Automated cold email workflow - Website enrichment script.
 
 This script processes websites from Supabase, enriches them with Exa.AI summaries,

@@ -47,48 +47,21 @@ def get_sheets_service():
 
 def get_sheet_id_for_project(project_id: str, supabase_client: Client) -> Optional[str]:
     """
-    Fetch sheet_id from prompts table for a given project_id.
-    Falls back to using project_id as sheet_id if not found in prompts table.
+    Get sheet_id for a given project_id.
     
-    This fallback is safe for recipe runs where project_id is the Google Sheets
-    spreadsheet ID itself.
+    For recipe runs, project_id is the Google Sheet ID / logical project key.
+    We no longer resolve sheet_id via the prompts table.
     
     Args:
-        project_id: Project ID to look up
-        supabase_client: Supabase client instance
+        project_id: Project ID (which is the sheet_id for recipe runs)
+        supabase_client: Supabase client instance (unused, kept for API compatibility)
         
     Returns:
-        sheet_id string if found in prompts table, or project_id as fallback.
-        Returns None only if project_id is invalid/empty or on database errors.
+        project_id as the sheet_id, or None if project_id is invalid/empty.
     """
-    try:
-        sheet_id_response = (
-            supabase_client.table('prompts')
-            .select('sheet_id')
-            .eq('project_id', project_id)
-            .eq('is_active', True)
-            .limit(1)
-            .execute()
-        )
-        
-        if sheet_id_response.data and len(sheet_id_response.data) > 0:
-            sheet_id = sheet_id_response.data[0].get('sheet_id')
-            if sheet_id and sheet_id.strip():
-                return sheet_id.strip()
-        
-        # Fallback: use project_id as sheet_id (safe for recipe runs)
-        if project_id and project_id.strip():
-            print(f"  [SHEET EXPORT] No sheet_id found for project_id={project_id}; falling back to using project_id as sheet_id")
-            return project_id.strip()
-        
-        return None
-    except Exception as e:
-        print(f"  [SHEET EXPORT] Error fetching sheet_id for project_id={project_id}: {str(e)}")
-        # On error, still try to fall back to project_id if it's valid
-        if project_id and project_id.strip():
-            print(f"  [SHEET EXPORT] Falling back to using project_id as sheet_id after error")
-            return project_id.strip()
-        return None
+    if project_id and project_id.strip():
+        return project_id.strip()
+    return None
 
 
 def read_tab_as_rows(service, sheet_id: str, tab_name: str) -> List[Dict[str, Any]]:
@@ -279,7 +252,7 @@ def export_results_to_google_sheets(project_id: str) -> None:
     Export all prospects for a project from Supabase to Google Sheets.
     
     Steps:
-    1. Fetch sheet_id from prompts table for this project_id
+    1. Use project_id as sheet_id (for recipe runs, project_id is the sheet ID)
     2. Read GOOGLE_SA_JSON from env and build a Sheets API client
     3. Query Supabase: SELECT * FROM prospects WHERE project_id=<id> ORDER BY id ASC
     4. Build a 2D list with first row = column names, following rows = values
@@ -287,7 +260,7 @@ def export_results_to_google_sheets(project_id: str) -> None:
     6. Write the data starting at A1 using spreadsheets.values.update(..., valueInputOption="RAW")
     
     Args:
-        project_id: Project ID to export results for
+        project_id: Project ID to export results for (also serves as sheet_id for recipe runs)
         
     Raises:
         Exception: If Sheets API fails (logged but not re-raised to avoid crashing worker)
@@ -298,10 +271,10 @@ def export_results_to_google_sheets(project_id: str) -> None:
             print("  [SHEET EXPORT] Supabase credentials not set, skipping export")
             return
         
-        # Step 1: Fetch sheet_id from prompts table
+        # Step 1: Use project_id as sheet_id (no longer query prompts table)
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        print(f"  [SHEET EXPORT] Fetching sheet_id for project_id={project_id}...")
+        print(f"  [SHEET EXPORT] Using project_id as sheet_id for project_id={project_id}...")
         sheet_id = get_sheet_id_for_project(project_id, supabase)
         
         if not sheet_id:

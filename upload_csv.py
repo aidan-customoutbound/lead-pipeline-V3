@@ -2,7 +2,10 @@
 Bulk upload script for prospect websites.
 
 This script reads websites from input.csv and uploads them to the Supabase prospects table,
-skipping duplicates. It also uploads prompts from the Prompts column to the public.prompts table.
+skipping duplicates.
+
+Note: Prompts table operations have been removed. The system now uses the Master sheet DSL
+and recipe_workflow.py for all AI + Exa behavior.
 """
 
 import csv
@@ -24,7 +27,7 @@ INPUT_CSV = "input.csv"
 
 
 class CSVUploader:
-    """Handles CSV upload to Supabase prospects table and prompts table."""
+    """Handles CSV upload to Supabase prospects table."""
     
     def __init__(self, project_id: str):
         """
@@ -45,7 +48,6 @@ class CSVUploader:
         
         # Initialize Supabase client
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        self.has_prompts_column: Optional[bool] = None
         self.project_id = project_id
     
     def test_connection(self) -> bool:
@@ -68,196 +70,6 @@ class CSVUploader:
             print(f"✗ Error connecting to Supabase: {str(e)}")
             return False
     
-    def check_prompts_column(self) -> bool:
-        """
-        Check if the prospects table has a 'prompts' column.
-        
-        Returns:
-            True if column exists, False otherwise
-        """
-        if self.has_prompts_column is not None:
-            return self.has_prompts_column
-        
-        try:
-            # Try to select prompts column - if it doesn't exist, this will fail
-            response = (
-                self.supabase.table('prospects')
-                .select('prompts')
-                .limit(1)
-                .execute()
-            )
-            self.has_prompts_column = True
-            return True
-        except Exception as e:
-            # If error mentions column doesn't exist, mark as False
-            error_str = str(e).lower()
-            if 'column' in error_str and ('does not exist' in error_str or 'not found' in error_str):
-                self.has_prompts_column = False
-                return False
-            # For other errors, assume column exists (safer to try)
-            self.has_prompts_column = True
-            return True
-    
-    def extract_prompts_from_rows(self, csv_rows: List[Dict[str, str]]) -> tuple[List[Dict[str, str]], int]:
-        """
-        Extract and normalize prompts, run_if, and branch from the Prompts, Run If, and Branch columns in CSV rows.
-        
-        Supports "Branch-only" steps: a row is considered a valid prompt step if it has:
-        - non-blank Prompts OR
-        - non-blank Branch
-        
-        Args:
-            csv_rows: List of CSV row dictionaries (from DictReader)
-            
-        Returns:
-            Tuple of (deduplicated prompts list with run_if and branch, raw count before deduplication)
-            Each item in the list is a dict with 'prompt_text', 'run_if', and 'branch' keys
-        """
-        prompts_raw = []
-        BRANCH_PLACEHOLDER = "BRANCH_CONTROLLED"
-        
-        if not csv_rows:
-            raise ValueError("CSV rows list is empty or invalid.")
-        
-        # Get fieldnames from first row keys
-        fieldnames = list(csv_rows[0].keys()) if csv_rows else []
-        
-        # Check if Prompts column exists (required for backward compatibility check)
-        # But we'll also accept Branch-only rows
-        has_prompts_column = 'Prompts' in fieldnames
-        has_branch_column = 'Branch' in fieldnames
-        
-        if not has_prompts_column and not has_branch_column:
-            raise ValueError(
-                f"CSV rows must have at least one of: 'Prompts' or 'Branch' columns. "
-                f"Found columns: {', '.join(fieldnames)}"
-            )
-        
-        # Collect all valid prompt steps (Prompts OR Branch non-empty)
-        for row in csv_rows:
-            prompt = row.get('Prompts', '').strip() if has_prompts_column else ''
-            branch = row.get('Branch', '').strip() if has_branch_column else ''
-            
-            # Row is valid if Prompts OR Branch is non-empty
-            if prompt or branch:
-                run_if = row.get('Run If', '').strip() if 'Run If' in fieldnames else ''
-                
-                # If Prompts is blank but Branch is present, use placeholder
-                if not prompt and branch:
-                    prompt_text = BRANCH_PLACEHOLDER
-                else:
-                    prompt_text = prompt
-                
-                prompts_raw.append({
-                    'prompt_text': prompt_text,
-                    'run_if': run_if if run_if else None,
-                    'branch': branch if branch else None
-                })
-        
-        prompts_found_raw = len(prompts_raw)
-        
-        # Deduplicate while preserving order (dedupe on tuple (prompt_text, run_if, branch))
-        prompts_seen = set()
-        prompts_deduplicated = []
-        for prompt_data in prompts_raw:
-            # Create dedupe key from tuple (prompt_text, run_if, branch)
-            dedupe_key = (
-                prompt_data['prompt_text'],
-                prompt_data.get('run_if'),
-                prompt_data.get('branch')
-            )
-            if dedupe_key not in prompts_seen:
-                prompts_seen.add(dedupe_key)
-                prompts_deduplicated.append(prompt_data)
-        
-        return prompts_deduplicated, prompts_found_raw
-    
-    def extract_prompts_from_csv(self, csv_path: str) -> tuple[List[Dict[str, str]], int]:
-        """
-        Extract and normalize prompts, run_if, and branch from the Prompts, Run If, and Branch columns in the CSV.
-        
-        Supports "Branch-only" steps: a row is considered a valid prompt step if it has:
-        - non-blank Prompts OR
-        - non-blank Branch
-        
-        Args:
-            csv_path: Path to the CSV file
-            
-        Returns:
-            Tuple of (deduplicated prompts list with run_if and branch, raw count before deduplication)
-            Each item in the list is a dict with 'prompt_text', 'run_if', and 'branch' keys
-        """
-        try:
-            with open(csv_path, 'r', encoding='utf-8') as csvfile:
-                reader = csv.DictReader(csvfile)
-                
-                # Check if CSV is valid
-                if reader.fieldnames is None:
-                    raise ValueError("CSV file appears to be empty or invalid.")
-                
-                # Convert reader to list of dicts
-                csv_rows = list(reader)
-                
-                # Use the row-based extraction method
-                return self.extract_prompts_from_rows(csv_rows)
-            
-        except FileNotFoundError:
-            raise FileNotFoundError(f"CSV file not found: {csv_path}")
-        except Exception as e:
-            raise Exception(f"Error reading prompts from CSV file: {str(e)}")
-    
-    def upload_prompts(self, prompts: List[Dict[str, str]], sheet_id: Optional[str] = None) -> None:
-        """
-        Replace all prompts in public.prompts table with the new prompt list.
-        
-        Args:
-            prompts: List of prompt dictionaries with 'prompt_text', 'run_if', and 'branch' keys
-            sheet_id: Optional Google Sheet ID to store with prompts
-            
-        Raises:
-            Exception: If upload fails
-        """
-        try:
-            # Delete all existing prompts for this project_id
-            delete_response = (
-                self.supabase.table('prompts')
-                .delete()
-                .eq('project_id', self.project_id)
-                .execute()
-            )
-            
-            # If no prompts to insert, we're done
-            if not prompts:
-                return
-            
-            # Prepare insert data
-            insert_data = []
-            for idx, prompt_data in enumerate(prompts, start=1):
-                insert_row = {
-                    'step_order': idx,
-                    'prompt_text': prompt_data['prompt_text'],
-                    'run_if': prompt_data.get('run_if'),
-                    'is_active': True,
-                    'step_name': f'step{idx}',
-                    'project_id': self.project_id
-                }
-                # Include branch if present
-                if 'branch' in prompt_data and prompt_data.get('branch'):
-                    insert_row['branch'] = prompt_data['branch']
-                # Include sheet_id if provided
-                if sheet_id:
-                    insert_row['sheet_id'] = sheet_id
-                insert_data.append(insert_row)
-            
-            # Insert new prompts
-            insert_response = (
-                self.supabase.table('prompts')
-                .insert(insert_data)
-                .execute()
-            )
-            
-        except Exception as e:
-            raise Exception(f"Error uploading prompts to database: {str(e)}")
     
     def get_existing_websites(self) -> Set[str]:
         """
@@ -303,7 +115,7 @@ class CSVUploader:
     def _normalize_website(self, website: str) -> str:
         """
         Normalize website URL: remove protocol, www, trailing slashes, convert to lowercase.
-        Matches normalization logic from enrich_workflow.py.
+        Matches normalization logic (legacy reference - enrich_workflow is deprecated).
         
         Args:
             website: Website URL to normalize
@@ -703,29 +515,6 @@ def run(project_id: str, csv_rows: List[Dict[str, str]], sheet_url: Optional[str
         print("Testing Supabase connection...")
         if not uploader.test_connection():
             raise Exception("Cannot proceed without a valid Supabase connection.")
-        
-        print("-" * 50)
-        
-        # Extract and upload prompts FIRST (before prospect upload)
-        print("Extracting prompts from CSV rows...")
-        try:
-            prompts_deduplicated, prompts_found_raw = uploader.extract_prompts_from_rows(csv_rows)
-            prompts_inserted = len(prompts_deduplicated)
-            
-            print(f"prompts_found_raw: {prompts_found_raw}")
-            print(f"prompts_inserted: {prompts_inserted}")
-            
-            # If zero prompts found, log error and raise
-            if prompts_inserted == 0:
-                raise Exception("Zero prompts found in CSV. Aborting to prevent accidental deletion of prompts table.")
-            
-            # Upload prompts with sheet_id
-            print("Uploading prompts to public.prompts...")
-            uploader.upload_prompts(prompts_deduplicated, sheet_id=sheet_id)
-            print(f"Deleted existing prompts and inserted {prompts_inserted} new prompts (with run_if and sheet_id).")
-            
-        except Exception as e:
-            raise Exception(f"Failed to upload prompts: {str(e)}")
         
         print("-" * 50)
         

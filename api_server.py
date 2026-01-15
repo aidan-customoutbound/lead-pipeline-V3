@@ -3,7 +3,7 @@ FastAPI web server for receiving HTTP POST requests from Google Sheets.
 
 Endpoints:
 - POST /upload: Trigger upload_csv.py for a given project_id
-- POST /start: Queue enrichment workflow for a given project_id
+- POST /start: Queue recipe workflow for a given project_id
 - POST /stop: Cancel any queued or running runs for a given project_id
 """
 
@@ -214,30 +214,40 @@ async def upload_endpoint(request: Request) -> JSONResponse:
 @app.post("/start")
 async def start_endpoint(request: Request) -> JSONResponse:
     """
-    Queue enrichment workflow for a given project_id.
+    Queue recipe workflow for a given project_id.
     
     Request body (JSON):
     {
         "project_id": "...",
         "secret": "...",
-        "run_type": "..." (optional, defaults to "enrichment")
+        "run_type": "..." (optional, defaults to "recipe")
     }
     
     Returns:
         JSON response with status='queued', project_id, and run_id
+        
+    Note:
+        Only 'recipe' run_type is supported. Enrichment workflow has been deprecated.
     """
     try:
         # Parse request body
         body = await request.json()
         project_id = body.get("project_id")
         secret = body.get("secret")
-        run_type = body.get("run_type", "enrichment")
+        run_type = body.get("run_type", "recipe")
         
-        # Default to 'enrichment' if run_type is not provided or blank
+        # Default to 'recipe' if run_type is not provided or blank
         if not run_type or not run_type.strip():
-            run_type = "enrichment"
+            run_type = "recipe"
         else:
             run_type = run_type.strip()
+        
+        # Only allow 'recipe' run_type - reject all others
+        if run_type != "recipe":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported run_type '{run_type}'. Only 'recipe' runs are supported now; enrichment has been deprecated."
+            )
         
         # Log request
         timestamp = datetime.utcnow().isoformat()
