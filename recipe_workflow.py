@@ -1069,13 +1069,19 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
     
     elif task_type in (TASK_FILTER_MATCH, TASK_FILTER_NOT_MATCH):
         source_sheet = params.get("source_sheet")
+        source_column = params.get("source_column")
         lookup_sheet = params.get("lookup_sheet")
+        lookup_column = params.get("lookup_column")
         
         # Validate that all required fields are non-empty
-        if not source_sheet:
-            return f"Row {row_index}: Source sheet is required"
-        if not lookup_sheet:
-            return f"Row {row_index}: Lookup sheet is required"
+        if not source_sheet or not isinstance(source_sheet, str) or not source_sheet.strip():
+            return f"Row {row_index}: Filter match task source_sheet is required"
+        if not source_column or not isinstance(source_column, str) or not source_column.strip():
+            return f"Row {row_index}: Filter match task source_column is required"
+        if not lookup_sheet or not isinstance(lookup_sheet, str) or not lookup_sheet.strip():
+            return f"Row {row_index}: Filter match task lookup_sheet is required"
+        if not lookup_column or not isinstance(lookup_column, str) or not lookup_column.strip():
+            return f"Row {row_index}: Filter match task lookup_column is required"
     
     elif task_type == TASK_COUNT_MATCHES:
         source_sheet = params.get("source_sheet")
@@ -1664,9 +1670,13 @@ def filter_match(work: Dict[str, List[Dict[str, Any]]],
                 source_sheet: str,
                 source_column: str,
                 lookup_sheet: str,
-                lookup_column: str) -> None:
+                lookup_column: str,
+                errors: List[str]) -> None:
     """
     Filter source_sheet to keep only rows where source_column value exists in lookup_sheet's lookup_column (inner join).
+    
+    Keep ONLY rows in SourceSheet where SourceColumn's value is present in LookupSheet.LookupColumn.
+    All other rows in SourceSheet are removed.
     
     Args:
         work: Dictionary mapping sheet names to their row lists (mutated)
@@ -1674,29 +1684,68 @@ def filter_match(work: Dict[str, List[Dict[str, Any]]],
         source_column: Column name in source sheet
         lookup_sheet: Name of lookup sheet in work
         lookup_column: Column name in lookup sheet
+        errors: List to append error messages to
     """
+    # Check sheet existence
     if source_sheet not in work:
-        work[source_sheet] = []
-    if lookup_sheet not in work:
-        work[lookup_sheet] = []
+        error_msg = f"Filter match task: source_sheet='{source_sheet}' not found; available sheets={list(work.keys())}"
+        print(f"[RECIPE][FILTER_MATCH][ERROR] {error_msg}")
+        errors.append(error_msg)
+        return
     
-    # Build set of lookup values (case-insensitive)
+    if lookup_sheet not in work:
+        error_msg = f"Filter match task: lookup_sheet='{lookup_sheet}' not found; available sheets={list(work.keys())}"
+        print(f"[RECIPE][FILTER_MATCH][ERROR] {error_msg}")
+        errors.append(error_msg)
+        return
+    
+    # Extract rows
+    source_rows = work[source_sheet]
     lookup_rows = work[lookup_sheet]
+    
+    # Check if source_column exists in source sheet
+    if source_rows:
+        available_keys = set()
+        for row in source_rows:
+            available_keys.update(row.keys())
+        if source_column not in available_keys:
+            error_msg = f"Filter match task: source_column='{source_column}' not found in source_sheet='{source_sheet}'; available columns={sorted(available_keys)}"
+            print(f"[RECIPE][FILTER_MATCH][ERROR] {error_msg}")
+            errors.append(error_msg)
+            return
+    
+    # Build lookup set from LookupSheet.LookupColumn
     lookup_values = set()
     for row in lookup_rows:
-        value = _safe_str(row.get(lookup_column)).lower()
-        if value:
-            lookup_values.add(value)
+        raw = row.get(lookup_column, "")
+        if raw is None:
+            raw = ""
+        val = str(raw).strip().lower()
+        if val:
+            lookup_values.add(val)
+    
+    # Log start
+    print(f"[RECIPE][FILTER_MATCH] source_sheet='{source_sheet}', source_column='{source_column}', lookup_sheet='{lookup_sheet}', lookup_column='{lookup_column}', lookup_distinct_values={len(lookup_values)}, rows_source_before={len(source_rows)}")
+    
+    # If lookup_values is empty, log warning but continue (result will be empty)
+    if not lookup_values:
+        print(f"[RECIPE][FILTER_MATCH] WARNING: lookup_sheet='{lookup_sheet}', lookup_column='{lookup_column}' has no non-empty values; all rows will be filtered out")
     
     # Filter source rows
-    source_rows = work[source_sheet]
     filtered = []
     for row in source_rows:
-        value = _safe_str(row.get(source_column)).lower()
-        if value in lookup_values:
+        raw = row.get(source_column, "")
+        if raw is None:
+            raw = ""
+        key = str(raw).strip().lower()
+        if key in lookup_values:
             filtered.append(row)
     
+    # Replace work[source_sheet] with filtered list
     work[source_sheet] = filtered
+    
+    # Log completion
+    print(f"[RECIPE][FILTER_MATCH] rows_after={len(filtered)}")
 
 
 def filter_not_match(work: Dict[str, List[Dict[str, Any]]],
@@ -3200,7 +3249,8 @@ def run_recipe(project_id: str,
                     task.params["source_sheet"],
                     task.params["source_column"],
                     task.params["lookup_sheet"],
-                    task.params["lookup_column"]
+                    task.params["lookup_column"],
+                    errors
                 )
             elif task.type == TASK_FILTER_NOT_MATCH:
                 filter_not_match(
