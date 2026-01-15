@@ -614,43 +614,34 @@ def _parse_copy_by_key(task_name: str) -> Optional[Dict[str, Any]]:
 
 def _parse_insert_column(task_name: str) -> Optional[Dict[str, Any]]:
     """
-    Parse 'Insert column - <SheetName> | <ColumnName>' pattern.
+    Parse 'Insert column - (SheetName, ColumnName)' pattern.
     
     Syntax examples:
-        Insert column - Contacts output | GPT_Notes
-        Insert column - URLs output | Segment Override
+        Insert column - (Contacts output, Situational)
+        insert column-(URLs output, Score)
+        INSERT COLUMN - ( DNC URL , Flag )
     
     Returns:
-        Dict with 'sheet_name' and 'column_name' keys, or None if parse fails
+        Dict with 'sheet' and 'column' keys, or None if parse fails
     """
-    # Check if task name starts with "Insert column -" (case-insensitive)
-    if not task_name.lower().startswith("insert column -"):
+    # Use regex to match: Insert column - (Sheet, Column)
+    # Case-insensitive, flexible whitespace
+    pattern = r'^Insert column\s*-\s*\(([^,]+),\s*([^)]+)\)$'
+    match = re.match(pattern, task_name, re.IGNORECASE)
+    
+    if not match:
         return None
     
-    # Remove the prefix and trim
-    prefix_len = len("Insert column -")
-    rest = task_name[prefix_len:].strip()
+    sheet = match.group(1).strip()
+    column = match.group(2).strip()
     
-    if not rest:
-        return None
-    
-    # Split by pipe character
-    tokens = [token.strip() for token in rest.split("|")]
-    
-    # Must have exactly 2 tokens
-    if len(tokens) != 2:
-        return None
-    
-    sheet_name = tokens[0]
-    column_name = tokens[1]
-    
-    # Validate that all tokens are non-empty
-    if not sheet_name or not column_name:
+    # Validate that both are non-empty
+    if not sheet or not column:
         return None
     
     return {
-        "sheet_name": sheet_name,
-        "column_name": column_name
+        "sheet": sheet,
+        "column": column
     }
 
 
@@ -1130,14 +1121,14 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
             return f"Row {row_index}: Copy by key task target_key_column is required"
     
     elif task_type == TASK_INSERT_COLUMN:
-        sheet_name = params.get("sheet_name")
-        column_name = params.get("column_name")
+        sheet = params.get("sheet")
+        column = params.get("column")
         
         # Validate that all required fields are non-empty
-        if not sheet_name:
-            return f"Row {row_index}: Insert column task sheet_name is required"
-        if not column_name:
-            return f"Row {row_index}: Insert column task column_name is required"
+        if not sheet:
+            return f"Row {row_index}: Insert column task sheet is required"
+        if not column:
+            return f"Row {row_index}: Insert column task column is required"
     
     elif task_type == TASK_COPY_COLUMNS:
         source_sheet = params.get("source_sheet")
@@ -1431,7 +1422,7 @@ def _extract_referenced_sheets(tasks: List[RecipeTask]) -> set:
             referenced_sheets.add(params.get("source_sheet"))
             referenced_sheets.add(params.get("target_sheet"))
         elif task.type == TASK_INSERT_COLUMN:
-            referenced_sheets.add(params.get("sheet_name"))
+            referenced_sheets.add(params.get("sheet"))
         elif task.type == TASK_COPY_COLUMNS:
             referenced_sheets.add(params.get("source_sheet"))
             referenced_sheets.add(params.get("target_sheet"))
@@ -2376,10 +2367,10 @@ def copy_by_key(
     print(f"[RECIPE][COPY_BY_KEY] completed source_sheet='{source_sheet}' -> target_sheet='{target_sheet}'")
 
 
-def insert_column_task(work: Dict[str, List[Dict[str, Any]]],
-                       sheet_name: str,
-                       column_name: str,
-                       logger: Optional[Any] = None) -> Optional[str]:
+def insert_column(work: Dict[str, List[Dict[str, Any]]],
+                   sheet: str,
+                   column_name: str,
+                   errors: List[str]) -> None:
     """
     Ensure that a given column exists on a given sheet.
     
@@ -2392,56 +2383,41 @@ def insert_column_task(work: Dict[str, List[Dict[str, Any]]],
     - Change any values except to add "" where the column didn't exist
     
     Example:
-        Insert column - Contacts output | GPT_Notes
-        - Ensures that "GPT_Notes" exists on "Contacts output"
+        Insert column - (Contacts output, Situational)
+        - Ensures that "Situational" exists on "Contacts output"
         - If it doesn't exist, creates it and sets "" for every row
         - If it already exists, leaves values as-is and backfills missing keys as ""
     
     Args:
         work: Dictionary mapping sheet names to their row lists (mutated)
-        sheet_name: Name of sheet in work
+        sheet: Name of sheet in work
         column_name: Name of column to ensure exists
-        logger: Optional logger for debug logging
-        
-    Returns:
-        Error message string if an error occurred, None if successful
+        errors: List to append error messages to
     """
-    # Step 1: Fetch sheet
-    rows = work.get(sheet_name)
+    print(f"[RECIPE][INSERT_COLUMN] sheet='{sheet}', col='{column_name}'")
     
-    if rows is None:
-        error_msg = f"Sheet '{sheet_name}' not found"
-        if logger:
-            logger.debug(f"insert_column_task: {error_msg}")
-        return error_msg
+    # Step 1: Check if sheet exists
+    if sheet not in work:
+        error_msg = f"sheet '{sheet}' not found"
+        print(f"[RECIPE][INSERT_COLUMN][ERROR] {error_msg}")
+        errors.append(error_msg)
+        return
+    
+    rows = work[sheet]
     
     try:
-        # Step 2: Check if column exists
-        # Determine whether column_name exists in the sheet
-        # Check if any row has that key
-        column_exists = False
-        if len(rows) > 0:
-            column_exists = any(column_name in row for row in rows)
-        
-        # Step 3: If column does NOT exist, create it with empty strings for all rows
-        if not column_exists:
-            for row in rows:
+        # Step 2: For each row, ensure column_name exists
+        # If column_name not in row, set it to ""
+        for row in rows:
+            if column_name not in row:
                 row[column_name] = ""
-        else:
-            # Step 4: If column DOES exist, ensure every row has a key for this column
-            # Backfill missing keys with empty strings
-            for row in rows:
-                if column_name not in row:
-                    row[column_name] = ""
         
-        # No other changes - we don't alter other columns, reorder rows, or perform any I/O
-        return None
+        print(f"[RECIPE][INSERT_COLUMN] Completed: added column '{column_name}' to sheet '{sheet}'")
     except Exception as e:
-        # Step 6: Error handling - catch unexpected exceptions
-        error_msg = f"Unexpected error in insert_column_task: {str(e)}"
-        if logger:
-            logger.debug(f"insert_column_task: {error_msg}")
-        return error_msg
+        # Step 3: Error handling - catch unexpected exceptions
+        error_msg = f"Unexpected error in insert_column: {str(e)}"
+        print(f"[RECIPE][INSERT_COLUMN][ERROR] {error_msg}")
+        errors.append(error_msg)
 
 
 def copy_columns(work: Dict[str, List[Dict[str, Any]]],
@@ -3278,20 +3254,12 @@ def run_recipe(project_id: str,
                     errors,
                 )
             elif task.type == TASK_INSERT_COLUMN:
-                try:
-                    error_msg = insert_column_task(
-                        work,
-                        task.params["sheet_name"],
-                        task.params["column_name"]
-                    )
-                    if error_msg:
-                        # Record task-level error but don't crash the recipe
-                        errors.append(f"Row {task.row_index}: {error_msg}")
-                        continue
-                except Exception as e:
-                    # Catch any unexpected exceptions and handle gracefully
-                    errors.append(f"Row {task.row_index}: Insert column task failed: {str(e)}")
-                    continue
+                insert_column(
+                    work,
+                    task.params["sheet"],
+                    task.params["column"],
+                    errors
+                )
             elif task.type == TASK_COPY_COLUMNS:
                 print(f"[RECIPE][COPY_COLUMNS] Executing task at row {task.row_index}")
                 copy_columns(
@@ -3353,7 +3321,7 @@ def run_recipe(project_id: str,
     urls_output_rows = work.get("URLs output") or []
     contacts_output_rows = work.get("Contacts output") or []
     
-    # Check if there were any runtime errors (e.g., from insert_column_task)
+    # Check if there were any runtime errors (e.g., from insert_column)
     if errors:
         return {
             "ok": False,
