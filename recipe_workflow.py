@@ -454,30 +454,32 @@ def _parse_remove_text(task_name: str) -> Optional[Dict[str, Any]]:
 
 def _parse_concatenate(task_name: str) -> Optional[Dict[str, Any]]:
     """
-    Parse 'Concatenate - (SheetName, OutputColumnName, SourceColumn1, SourceColumn2, "Separator")' pattern.
+    Parse 'Concatenate - (SheetName, OutputColumn, InputColumn1 | InputColumn2 | InputColumn3 | ...)' pattern.
     
     Returns:
-        Dict with 'sheet', 'output_column', 'source_column1', 'source_column2', and 'separator' keys, or None if parse fails
+        Dict with 'sheet', 'output_column', and 'input_columns' keys, or None if parse fails
     """
-    # Pattern: Concatenate - (SheetName, OutputColumnName, SourceColumn1, SourceColumn2, "Separator")
-    # Need to handle quoted string for separator
-    pattern = r'^Concatenate\s*-\s*\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*"([^"]+)"\)$'
+    # Pattern: Concatenate - (SheetName, OutputColumn, InputColumn1 | InputColumn2 | InputColumn3 | ...)
+    pattern = r'^Concatenate\s*-\s*\(([^,]+),\s*([^,]+),\s*(.+)\)$'
     match = re.match(pattern, task_name, re.IGNORECASE)
     if not match:
         return None
     
     sheet = match.group(1).strip()
     output_column = match.group(2).strip()
-    source_column1 = match.group(3).strip()
-    source_column2 = match.group(4).strip()
-    separator = match.group(5).strip()
+    inputs_raw = match.group(3).strip()
+    
+    # Split on | and filter out empty parts
+    parts = [p.strip() for p in inputs_raw.split("|")]
+    parts = [p for p in parts if p]  # Filter out empty parts
+    
+    if not parts:
+        return None
     
     return {
         "sheet": sheet,
         "output_column": output_column,
-        "source_column1": source_column1,
-        "source_column2": source_column2,
-        "separator": separator
+        "input_columns": parts,
     }
 
 
@@ -1038,12 +1040,27 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
             return f"Row {row_index}: Copy sheet target is required"
     
     elif task_type in (TASK_DEDUPLICATE, TASK_NORMALIZE_URLS, TASK_FILTER_INCLUDE, 
-                       TASK_FILTER_EXCLUDE, TASK_FILTER_BLANK, TASK_COUNT_BY, TASK_SORT, TASK_REMOVE_CHARACTERS, TASK_CONCATENATE):
+                       TASK_FILTER_EXCLUDE, TASK_FILTER_BLANK, TASK_COUNT_BY, TASK_SORT, TASK_REMOVE_CHARACTERS):
         sheet = params.get("sheet")
         
         # Validate that all required fields are non-empty
         if not sheet:
             return f"Row {row_index}: Sheet name is required"
+    
+    elif task_type == TASK_CONCATENATE:
+        sheet = params.get("sheet")
+        output_column = params.get("output_column")
+        input_columns = params.get("input_columns")
+        
+        if not sheet:
+            return f"Row {row_index}: Concatenate task sheet is required"
+        if not output_column:
+            return f"Row {row_index}: Concatenate task output_column is required"
+        if not input_columns or not isinstance(input_columns, list) or len(input_columns) == 0:
+            return f"Row {row_index}: Concatenate task must have at least one input column"
+        for col in input_columns:
+            if not col or not isinstance(col, str) or not col.strip():
+                return f"Row {row_index}: Concatenate task input columns must be non-empty strings"
     
     elif task_type == TASK_REMOVE_TEXT:
         sheet_name = params.get("sheet_name")
@@ -2000,63 +2017,66 @@ def remove_text_task(work: Dict[str, List[Dict[str, Any]]],
         row[column_name] = cleaned_value
 
 
-def concatenate(work: Dict[str, List[Dict[str, Any]]],
-                sheet: str,
-                output_column: str,
-                source_column1: str,
-                source_column2: str,
-                separator: str) -> None:
+def concatenate(
+        work: Dict[str, List[Dict[str, Any]]],
+        sheet: str,
+        output_column: str,
+        input_columns: List[str],
+        errors: List[str],
+    ) -> None:
     """
-    Concatenate two source columns into an output column.
+    Concatenate multiple input columns into an output column.
     
-    For each row, combines source_column1 + separator + source_column2
-    and writes the result to output_column. If output_column doesn't exist,
-    it will be created.
-    
-    Examples:
-        - First Name="Aidan", Last Name="Pits", Separator=" " → "Aidan Pits"
-        - First Name="", Company="Stripe", Separator=" at " → " at Stripe"
+    For each row:
+    - Read values from each InputColumn in the given order.
+    - Treat missing or None values as "".
+    - Strip whitespace from each input value.
+    - Ignore completely empty values when building the output.
+    - Join the non-empty pieces with a single space " ".
+    - If all input columns are empty, the result is "".
+    - Write the result string to OutputColumn in that row.
     
     Args:
         work: Dictionary mapping sheet names to their row lists (mutated)
         sheet: Name of sheet in work
         output_column: Column name to write concatenated result to
-        source_column1: First source column name
-        source_column2: Second source column name
-        separator: String to insert between the two values
-        
-    Raises:
-        ValueError: If either source column doesn't exist in the sheet
+        input_columns: List of input column names to concatenate
+        errors: List to append error messages to
     """
     if sheet not in work:
-        work[sheet] = []
+        error_msg = f"Concatenate: sheet '{sheet}' not found"
+        print(f"[RECIPE][CONCATENATE][ERROR] sheet='{sheet}' not found; available sheets={list(work.keys())}")
+        errors.append(error_msg)
+        return
     
     rows = work[sheet]
     
-    # Validate that source columns exist (check if they appear in any row)
-    if len(rows) > 0:
-        source1_exists = any(source_column1 in row for row in rows)
-        source2_exists = any(source_column2 in row for row in rows)
-        
-        if not source1_exists:
-            raise ValueError(f"Source column '{source_column1}' does not exist in sheet '{sheet}'")
-        if not source2_exists:
-            raise ValueError(f"Source column '{source_column2}' does not exist in sheet '{sheet}'")
+    if not rows:
+        print(f"[RECIPE][CONCATENATE] sheet='{sheet}' has no rows; nothing to concatenate")
+        return
+    
+    print(f"[RECIPE][CONCATENATE] sheet='{sheet}', output_column='{output_column}', input_columns={input_columns}, row_count={len(rows)}")
     
     for row in rows:
-        # Fetch values, defaulting to empty string if missing/undefined
-        value1 = row.get(source_column1)
-        value2 = row.get(source_column2)
+        pieces = []
         
-        # Convert to strings (handles None by converting to "")
-        value1_str = str(value1) if value1 is not None else ""
-        value2_str = str(value2) if value2 is not None else ""
+        for col_name in input_columns:
+            raw = row.get(col_name, "")
+            if raw is None:
+                raw = ""
+            text = str(raw).strip()
+            if text:
+                pieces.append(text)
         
-        # Concatenate: value1 + separator + value2
-        result = value1_str + separator + value2_str
+        if not pieces:
+            result = ""
+        else:
+            result = " ".join(pieces)
         
-        # Write to output column
         row[output_column] = result
+    
+    work[sheet] = rows
+    print(f"[RECIPE][CONCATENATE] completed sheet='{sheet}', output_column='{output_column}', rows_updated={len(rows)}")
 
 
 def assign_other_task(work: Dict[str, List[Dict[str, Any]]],
@@ -3223,9 +3243,8 @@ def run_recipe(project_id: str,
                     work,
                     task.params["sheet"],
                     task.params["output_column"],
-                    task.params["source_column1"],
-                    task.params["source_column2"],
-                    task.params["separator"]
+                    task.params["input_columns"],
+                    errors,
                 )
             elif task.type == TASK_MAP:
                 map_task(
