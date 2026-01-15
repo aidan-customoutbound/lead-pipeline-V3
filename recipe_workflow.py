@@ -47,6 +47,7 @@ TASK_ASSIGN_OTHER = "ASSIGN_OTHER"
 TASK_COPY_BY_KEY = "COPY_BY_KEY"
 TASK_INSERT_COLUMN = "INSERT_COLUMN"
 TASK_COPY_COLUMNS = "COPY_COLUMNS"
+TASK_APPEND_COLUMN = "APPEND_COLUMN"
 TASK_AI = "AI"
 TASK_EXA = "EXA"
 TASK_COUNT_MATCHES = "COUNT_MATCHES"
@@ -723,6 +724,51 @@ def _parse_copy_columns(task_name: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _parse_append_column(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Append column - (SourceSheet, SourceColumn, TargetSheet, TargetColumn)' pattern.
+    
+    Syntax example:
+        Append column - (SourceSheet, SourceColumn, TargetSheet, TargetColumn)
+    
+    Returns:
+        Dict with 'source_sheet', 'source_column', 'target_sheet', and 'target_column' keys,
+        or None if parse fails
+    """
+    # Check if task name starts with "Append column -" (case-insensitive)
+    if not task_name.lower().startswith("append column -"):
+        return None
+    
+    # Remove the prefix and trim
+    prefix_len = len("Append column -")
+    rest = task_name[prefix_len:].strip()
+    
+    if not rest:
+        return None
+    
+    # Pattern: (SourceSheet, SourceColumn, TargetSheet, TargetColumn)
+    pattern = r'^\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)$'
+    match = re.match(pattern, rest, re.IGNORECASE)
+    if not match:
+        return None
+    
+    source_sheet = match.group(1).strip()
+    source_column = match.group(2).strip()
+    target_sheet = match.group(3).strip()
+    target_column = match.group(4).strip()
+    
+    # Validate that all fields are non-empty
+    if not source_sheet or not source_column or not target_sheet or not target_column:
+        return None
+    
+    return {
+        "source_sheet": source_sheet,
+        "source_column": source_column,
+        "target_sheet": target_sheet,
+        "target_column": target_column
+    }
+
+
 def _parse_exa_condition(condition_segment: str) -> Optional[Dict[str, str]]:
     """
     Parse a WHEN condition segment: 'WHEN {ColumnName} is not empty'
@@ -1178,6 +1224,22 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         if not mappings or not isinstance(mappings, list) or len(mappings) == 0:
             return f"Row {row_index}: Copy columns task must have at least one column mapping"
     
+    elif task_type == TASK_APPEND_COLUMN:
+        source_sheet = params.get("source_sheet")
+        source_column = params.get("source_column")
+        target_sheet = params.get("target_sheet")
+        target_column = params.get("target_column")
+        
+        # Validate that all required fields are non-empty
+        if not source_sheet:
+            return f"Row {row_index}: Append column task source_sheet is required"
+        if not source_column:
+            return f"Row {row_index}: Append column task source_column is required"
+        if not target_sheet:
+            return f"Row {row_index}: Append column task target_sheet is required"
+        if not target_column:
+            return f"Row {row_index}: Append column task target_column is required"
+    
     elif task_type == TASK_AI:
         input_sheet = params.get("input_sheet")
         output_sheet = params.get("output_sheet")
@@ -1358,6 +1420,11 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             if parsed:
                 task_type = TASK_COPY_COLUMNS
                 params = parsed
+        elif task_name.lower().startswith("append column"):
+            parsed = _parse_append_column(task_name)
+            if parsed:
+                task_type = TASK_APPEND_COLUMN
+                params = parsed
         elif task_name.lower().startswith("ai -"):
             parsed = _parse_ai_task(task_name)
             if parsed:
@@ -1449,6 +1516,9 @@ def _extract_referenced_sheets(tasks: List[RecipeTask]) -> set:
         elif task.type == TASK_INSERT_COLUMN:
             referenced_sheets.add(params.get("sheet"))
         elif task.type == TASK_COPY_COLUMNS:
+            referenced_sheets.add(params.get("source_sheet"))
+            referenced_sheets.add(params.get("target_sheet"))
+        elif task.type == TASK_APPEND_COLUMN:
             referenced_sheets.add(params.get("source_sheet"))
             referenced_sheets.add(params.get("target_sheet"))
         elif task.type == TASK_AI:
@@ -2562,6 +2632,72 @@ def copy_columns(work: Dict[str, List[Dict[str, Any]]],
     print(f"[RECIPE][COPY_COLUMNS] Completed copying {len(mappings)} column(s)")
 
 
+def append_column(work: Dict[str, List[Dict[str, Any]]],
+                  source_sheet: str,
+                  source_column: str,
+                  target_sheet: str,
+                  target_column: str,
+                  errors: List[str]) -> None:
+    """
+    Append all non-blank values from SourceColumn onto end of TargetColumn.
+    
+    For each non-blank value in source_column of source_sheet:
+    - Appends the value as a new row in target_sheet with only target_column set
+    - Skips blank/empty values
+    - Protects against missing sheets and missing columns
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        source_sheet: Name of source sheet in work
+        source_column: Name of source column to read from
+        target_sheet: Name of target sheet in work
+        target_column: Name of target column to append to
+        errors: List to append error messages to (mutated)
+    """
+    print(f"[RECIPE][APPEND_COLUMN] Source sheet: {source_sheet}, Source column: {source_column}")
+    print(f"[RECIPE][APPEND_COLUMN] Target sheet: {target_sheet}, Target column: {target_column}")
+    
+    # Validate sheets exist
+    if source_sheet not in work:
+        error_msg = f"[RECIPE][APPEND_COLUMN][ERROR] Source sheet missing: {source_sheet}; available sheets={list(work.keys())}"
+        print(error_msg)
+        errors.append(error_msg)
+        return
+    
+    if target_sheet not in work:
+        error_msg = f"[RECIPE][APPEND_COLUMN][ERROR] Target sheet missing: {target_sheet}; available sheets={list(work.keys())}"
+        print(error_msg)
+        errors.append(error_msg)
+        return
+    
+    source_rows = work[source_sheet]
+    target_rows = work[target_sheet]
+    
+    # Verify columns exist or create empty one (protect against missing columns)
+    for row in source_rows:
+        if source_column not in row:
+            row[source_column] = ""
+    
+    for row in target_rows:
+        if target_column not in row:
+            row[target_column] = ""
+    
+    # Collect non-blank values
+    new_values = []
+    for row in source_rows:
+        val = row.get(source_column, "").strip()
+        if val:
+            new_values.append(val)
+    
+    print(f"[RECIPE][APPEND_COLUMN] Found {len(new_values)} non-blank values to append")
+    
+    # Append each value as a new row
+    for val in new_values:
+        target_rows.append({target_column: val})
+    
+    print(f"[RECIPE][APPEND_COLUMN] Completed appending {len(new_values)} value(s) to {target_sheet}")
+
+
 def _map_model_name(model_name: str) -> str:
     """
     Map user-friendly model names to OpenRouter model identifiers.
@@ -3542,6 +3678,16 @@ def run_recipe(project_id: str,
                     task.params["source_sheet"],
                     task.params["target_sheet"],
                     task.params["mappings"],
+                    errors
+                )
+            elif task.type == TASK_APPEND_COLUMN:
+                print(f"[RECIPE][APPEND_COLUMN] Executing task at row {task.row_index}")
+                append_column(
+                    work,
+                    task.params["source_sheet"],
+                    task.params["source_column"],
+                    task.params["target_sheet"],
+                    task.params["target_column"],
                     errors
                 )
             elif task.type == TASK_AI:
