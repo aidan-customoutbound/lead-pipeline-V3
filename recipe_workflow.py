@@ -51,6 +51,7 @@ TASK_APPEND_COLUMN = "APPEND_COLUMN"
 TASK_AI = "AI"
 TASK_EXA = "EXA"
 TASK_COUNT_MATCHES = "COUNT_MATCHES"
+TASK_LOWERCASE_COLUMN = "LOWERCASE_COLUMN"
 
 # Input sheet names (read-only)
 INPUT_SHEETS = {"URLs", "Contacts", "Master"}
@@ -192,6 +193,25 @@ def _parse_normalize_urls(task_name: str) -> Optional[Dict[str, Any]]:
     output_column = match.group(3).strip()
     
     return {"sheet": sheet, "source_column": source_column, "output_column": output_column}
+
+
+def _parse_lowercase_column(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Lowercase column - (SheetName, SourceColumn, TargetColumn)' pattern.
+    
+    Returns:
+        Dict with 'sheet', 'source_column', and 'target_column' keys, or None if parse fails
+    """
+    pattern = r'^Lowercase column\s*-\s*\(([^,]+),\s*([^,]+),\s*([^)]+)\)$'
+    match = re.match(pattern, task_name, re.IGNORECASE)
+    if not match:
+        return None
+    
+    sheet = match.group(1).strip()
+    source_column = match.group(2).strip()
+    target_column = match.group(3).strip()
+    
+    return {"sheet": sheet, "source_column": source_column, "target_column": target_column}
 
 
 def _parse_filter_include(task_name: str) -> Optional[Dict[str, Any]]:
@@ -1078,7 +1098,7 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
         if not target:
             return f"Row {row_index}: Copy sheet target is required"
     
-    elif task_type in (TASK_DEDUPLICATE, TASK_NORMALIZE_URLS, TASK_FILTER_INCLUDE, 
+    elif task_type in (TASK_DEDUPLICATE, TASK_NORMALIZE_URLS, TASK_LOWERCASE_COLUMN, TASK_FILTER_INCLUDE, 
                        TASK_FILTER_EXCLUDE, TASK_FILTER_BLANK, TASK_COUNT_BY, TASK_SORT, TASK_REMOVE_CHARACTERS):
         sheet = params.get("sheet")
         
@@ -1340,6 +1360,11 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             if parsed:
                 task_type = TASK_NORMALIZE_URLS
                 params = parsed
+        elif task_name.lower().startswith("lowercase column"):
+            parsed = _parse_lowercase_column(task_name)
+            if parsed:
+                task_type = TASK_LOWERCASE_COLUMN
+                params = parsed
         elif task_name.lower().startswith("filter include"):
             parsed = _parse_filter_include(task_name)
             if parsed:
@@ -1479,6 +1504,8 @@ def _extract_referenced_sheets(tasks: List[RecipeTask]) -> set:
         elif task.type == TASK_DEDUPLICATE:
             referenced_sheets.add(params.get("sheet"))
         elif task.type == TASK_NORMALIZE_URLS:
+            referenced_sheets.add(params.get("sheet"))
+        elif task.type == TASK_LOWERCASE_COLUMN:
             referenced_sheets.add(params.get("sheet"))
         elif task.type == TASK_FILTER_INCLUDE:
             referenced_sheets.add(params.get("sheet"))
@@ -1637,6 +1664,58 @@ def normalize_urls(work: Dict[str, List[Dict[str, Any]]],
         rows_processed += 1
     
     print(f"[RECIPE][NORMALIZE_URLS] sheet='{sheet}', rows_processed={rows_processed}, rows_after={len(rows)}")
+
+
+def lowercase_column(work: Dict[str, List[Dict[str, Any]]],
+                     sheet: str,
+                     source_column: str,
+                     target_column: str) -> None:
+    """
+    Lowercase text from source_column and write to target_column.
+    Only applies when the source column is non-empty for a given row.
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        sheet: Name of sheet in work
+        source_column: Column name containing text to lowercase
+        target_column: Column name to write lowercased text to
+    """
+    rows_before = len(work.get(sheet, []))
+    print(f"[RECIPE][LOWERCASE_COLUMN] sheet='{sheet}', source_column='{source_column}', target_column='{target_column}', rows_before={rows_before}")
+    
+    if sheet not in work:
+        print(f"[RECIPE][LOWERCASE_COLUMN] WARNING: sheet='{sheet}' not found in work, creating empty sheet")
+        work[sheet] = []
+    
+    rows = work[sheet]
+    
+    if not rows:
+        print(f"[RECIPE][LOWERCASE_COLUMN] sheet='{sheet}' has no rows, returning without modification")
+        return
+    
+    # Check if source column exists in at least one row
+    available_keys = set()
+    for row in rows:
+        available_keys.update(row.keys())
+    
+    if source_column not in available_keys:
+        print(f"[RECIPE][LOWERCASE_COLUMN] WARNING: source_column='{source_column}' not found in sheet='{sheet}', available_keys={sorted(available_keys)}")
+    
+    rows_processed = 0
+    rows_modified = 0
+    for row in rows:
+        source_value = row.get(source_column)
+        
+        # Only apply if source value is non-empty after stripping whitespace
+        if source_value is not None and str(source_value).strip():
+            # Convert to string and lowercase it
+            lowercased = str(source_value).lower()
+            row[target_column] = lowercased
+            rows_modified += 1
+        # If source value is empty/blank, leave target_column as-is
+        rows_processed += 1
+    
+    print(f"[RECIPE][LOWERCASE_COLUMN] sheet='{sheet}', rows_processed={rows_processed}, rows_modified={rows_modified}, rows_after={len(rows)}")
 
 
 def filter_include(work: Dict[str, List[Dict[str, Any]]],
@@ -3553,6 +3632,14 @@ def run_recipe(project_id: str,
                     task.params["sheet"],
                     task.params["source_column"],
                     task.params["output_column"]
+                )
+            elif task.type == TASK_LOWERCASE_COLUMN:
+                print(f"[RECIPE][LOWERCASE_COLUMN] Executing task at row {task.row_index}")
+                lowercase_column(
+                    work,
+                    task.params["sheet"],
+                    task.params["source_column"],
+                    task.params["target_column"]
                 )
             elif task.type == TASK_FILTER_INCLUDE:
                 filter_include(
