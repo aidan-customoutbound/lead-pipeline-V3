@@ -54,6 +54,38 @@ def get_supabase_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
+def _insert_task_stats(supabase_client, run_id: int, project_id: str, ai_task_stats: List[Dict[str, Any]]) -> None:
+    """
+    Insert per-task AI stats into run_task_stats table.
+    
+    This function is guarded with error handling so it won't crash if the table doesn't exist yet.
+    
+    Args:
+        supabase_client: Supabase client instance
+        run_id: Run ID
+        project_id: Project ID
+        ai_task_stats: List of task stat dicts with keys: task_index, task_name, calls, cost_credits, prompt_tokens, completion_tokens
+    """
+    if not ai_task_stats:
+        return
+    
+    try:
+        for task_stat in ai_task_stats:
+            supabase_client.table("run_task_stats").insert({
+                "run_id": run_id,
+                "project_id": project_id,
+                "task_index": task_stat.get("task_index"),
+                "task_name": task_stat.get("task_name", ""),
+                "ai_calls": task_stat.get("calls", 0),
+                "ai_total_cost_credits": task_stat.get("cost_credits", 0.0),
+                "ai_total_prompt_tokens": task_stat.get("prompt_tokens", 0),
+                "ai_total_completion_tokens": task_stat.get("completion_tokens", 0)
+            }).execute()
+    except Exception as e:
+        # Log error but don't crash - table may not exist yet
+        log(f"Warning: Could not insert task stats for run {run_id}: {str(e)}")
+
+
 def is_run_active(supabase_client, run_id):
     """
     Returns True only if the current run's status is 'running'.
@@ -255,6 +287,14 @@ def process_run(run_row, supabase):
                 log(f"Run {run_id} is no longer active, stopping before writing results")
                 return
             
+            # Extract AI stats from result (always present, even if empty)
+            ai_run_stats = result.get("ai_run_stats", {
+                "total_cost_credits": 0.0,
+                "total_prompt_tokens": 0,
+                "total_completion_tokens": 0
+            })
+            ai_task_stats = result.get("ai_task_stats", [])
+            
             # Store debug logs in error_message column (regardless of success/failure)
             debug_logs_text = "\n".join(debug_logs) if debug_logs else ""
             
@@ -274,11 +314,18 @@ def process_run(run_row, supabase):
                     error_message = combined_message
                 
                 finished_at = datetime.utcnow()
-                supabase.table("runs").update({
+                update_data = {
                     "status": "failed",
                     "finished_at": finished_at.isoformat(),
-                    "error_message": error_message
-                }).eq("id", run_id).eq("status", "running").execute()
+                    "error_message": error_message,
+                    "ai_total_cost_credits": ai_run_stats.get("total_cost_credits", 0.0),
+                    "ai_total_prompt_tokens": ai_run_stats.get("total_prompt_tokens", 0),
+                    "ai_total_completion_tokens": ai_run_stats.get("total_completion_tokens", 0)
+                }
+                supabase.table("runs").update(update_data).eq("id", run_id).eq("status", "running").execute()
+                
+                # Insert per-task stats (with error handling in case table doesn't exist)
+                _insert_task_stats(supabase, run_id, project_id, ai_task_stats)
                 
                 log(f"Failed recipe run {run_id} for project {project_id}: {error_message}")
                 return
@@ -302,10 +349,30 @@ def process_run(run_row, supabase):
             log(f"[worker] Wrote back {sheets_written} sheets to Google Sheets")
             
             # Update Master statuses (special handling - don't overwrite entire Master tab)
-            master_status_updates = result.get("master_status_updates")
-            if master_status_updates:
-                log(f"[worker] Updating {len(master_status_updates)} Master status rows")
-                update_master_statuses(service, sheet_id, "Master", master_status_updates)
+            master_status_updates = result.get("master_status_updates", [])
+            
+            # Enrich master_status_updates with cost info for AI tasks
+            # Build a map of task_index -> cost_usd from ai_task_stats
+            task_cost_map = {}
+            ai_credits_to_usd = float(os.getenv("AI_CREDITS_TO_USD", "1.0"))
+            for task_stat in ai_task_stats:
+                task_index = task_stat.get("task_index")
+                cost_credits = task_stat.get("cost_credits", 0.0)
+                if task_index is not None:
+                    task_cost_map[task_index] = cost_credits * ai_credits_to_usd
+            
+            # Add cost_usd to each update entry if it's an AI task
+            enriched_updates = []
+            for update in master_status_updates:
+                enriched_update = update.copy()
+                task_index = update.get("row_index")
+                if task_index in task_cost_map:
+                    enriched_update["cost_usd"] = task_cost_map[task_index]
+                enriched_updates.append(enriched_update)
+            
+            if enriched_updates:
+                log(f"[worker] Updating {len(enriched_updates)} Master status rows (with cost info)")
+                update_master_statuses(service, sheet_id, "Master", enriched_updates)
             
             # Check if run is still active before marking as completed
             if not is_run_active(supabase, run_id):
@@ -316,13 +383,19 @@ def process_run(run_row, supabase):
             finished_at = datetime.utcnow()
             update_data = {
                 "status": "completed",
-                "finished_at": finished_at.isoformat()
+                "finished_at": finished_at.isoformat(),
+                "ai_total_cost_credits": ai_run_stats.get("total_cost_credits", 0.0),
+                "ai_total_prompt_tokens": ai_run_stats.get("total_prompt_tokens", 0),
+                "ai_total_completion_tokens": ai_run_stats.get("total_completion_tokens", 0)
             }
             if debug_logs_text:
                 # Truncate if too long
                 update_data["error_message"] = debug_logs_text[:5000] if len(debug_logs_text) > 5000 else debug_logs_text
             
             supabase.table("runs").update(update_data).eq("id", run_id).eq("status", "running").execute()
+            
+            # Insert per-task stats (with error handling in case table doesn't exist)
+            _insert_task_stats(supabase, run_id, project_id, ai_task_stats)
             
             log(f"Completed recipe run {run_id} for project {project_id}")
             
@@ -348,12 +421,37 @@ def process_run(run_row, supabase):
                     combined_message = combined_message[:5000]
                 error_message = combined_message
             
+            # Try to extract AI stats from result if available (may not be if exception occurred before recipe completed)
+            ai_run_stats = {}
+            ai_task_stats = []
             try:
-                supabase.table("runs").update({
+                if 'result' in locals():
+                    ai_run_stats = result.get("ai_run_stats", {
+                        "total_cost_credits": 0.0,
+                        "total_prompt_tokens": 0,
+                        "total_completion_tokens": 0
+                    })
+                    ai_task_stats = result.get("ai_task_stats", [])
+            except:
+                ai_run_stats = {
+                    "total_cost_credits": 0.0,
+                    "total_prompt_tokens": 0,
+                    "total_completion_tokens": 0
+                }
+            
+            try:
+                update_data = {
                     "status": "failed",
                     "finished_at": finished_at.isoformat(),
-                    "error_message": error_message
-                }).eq("id", run_id).eq("status", "running").execute()
+                    "error_message": error_message,
+                    "ai_total_cost_credits": ai_run_stats.get("total_cost_credits", 0.0),
+                    "ai_total_prompt_tokens": ai_run_stats.get("total_prompt_tokens", 0),
+                    "ai_total_completion_tokens": ai_run_stats.get("total_completion_tokens", 0)
+                }
+                supabase.table("runs").update(update_data).eq("id", run_id).eq("status", "running").execute()
+                
+                # Insert per-task stats (with error handling in case table doesn't exist)
+                _insert_task_stats(supabase, run_id, project_id, ai_task_stats)
             except Exception as update_error:
                 log(f"Error updating run {run_id} to failed: {str(update_error)}")
             

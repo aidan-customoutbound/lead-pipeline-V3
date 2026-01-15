@@ -22,6 +22,11 @@ from exa_py import Exa
 # Load environment variables for AI client
 load_dotenv()
 
+# AI configuration from environment variables (with defaults)
+AI_MAX_CONCURRENT_PER_TASK = int(os.getenv("AI_MAX_CONCURRENT_PER_TASK", "10"))
+AI_RUN_BUDGET_USD = float(os.getenv("AI_RUN_BUDGET_USD", "10.0"))
+AI_CREDITS_TO_USD = float(os.getenv("AI_CREDITS_TO_USD", "1.0"))
+
 
 # Task type constants
 TASK_COPY_SHEET = "COPY_SHEET"
@@ -2607,7 +2612,7 @@ async def _call_ai_with_retry(
     model: str,
     max_retries: int = 3,
     backoff_delays: List[float] = None
-) -> Optional[str]:
+) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Call AI model with retry logic and exponential backoff.
     
@@ -2616,16 +2621,23 @@ async def _call_ai_with_retry(
         prompt: The prompt text to send
         model: Model identifier
         max_retries: Maximum number of retry attempts
-        backoff_delays: List of delay seconds for each retry (default: [1, 2])
+        backoff_delays: List of delay seconds for each retry (default: [1, 2, 4])
         
     Returns:
-        Response text or None if all attempts fail
+        Tuple of (response_text or None, usage_dict)
+        usage_dict contains: cost_credits (float), prompt_tokens (int), completion_tokens (int)
+        If call fails, returns (None, {"cost_credits": 0.0, "prompt_tokens": 0, "completion_tokens": 0})
     """
     if backoff_delays is None:
-        backoff_delays = [1, 2]
+        backoff_delays = [1, 2, 4]  # Exponential backoff: 1s, 2s, 4s
+    
+    default_usage = {"cost_credits": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
     
     for attempt in range(max_retries):
         try:
+            # OpenRouter API call with usage tracking
+            # Note: OpenRouter includes usage info in the response by default
+            # Headers are set when creating the client, not here
             response = await client.chat.completions.create(
                 model=model,
                 messages=[
@@ -2637,17 +2649,65 @@ async def _call_ai_with_retry(
             
             if response and response.choices and len(response.choices) > 0:
                 result = response.choices[0].message.content.strip()
-                return result
+                
+                # Parse usage from response
+                usage = default_usage.copy()
+                if hasattr(response, 'usage') and response.usage:
+                    usage["prompt_tokens"] = getattr(response.usage, 'prompt_tokens', 0) or 0
+                    usage["completion_tokens"] = getattr(response.usage, 'completion_tokens', 0) or 0
+                
+                # Try to extract cost from response
+                # OpenRouter includes cost in the response, but the OpenAI client may not expose it directly
+                # We'll try to get it from the raw response if available
+                try:
+                    # Check if response has model_response or similar attribute
+                    if hasattr(response, 'model_response'):
+                        raw_data = response.model_response
+                    elif hasattr(response, '_raw_response'):
+                        raw_data = response._raw_response
+                    else:
+                        raw_data = None
+                    
+                    if raw_data and isinstance(raw_data, dict):
+                        # OpenRouter may include cost in various places
+                        if 'usage' in raw_data and isinstance(raw_data['usage'], dict):
+                            usage_dict = raw_data['usage']
+                            if 'total_cost' in usage_dict:
+                                usage["cost_credits"] = float(usage_dict['total_cost'])
+                            elif 'cost' in usage_dict:
+                                usage["cost_credits"] = float(usage_dict['cost'])
+                        elif 'total_cost' in raw_data:
+                            usage["cost_credits"] = float(raw_data['total_cost'])
+                        elif 'cost' in raw_data:
+                            usage["cost_credits"] = float(raw_data['cost'])
+                except (ValueError, KeyError, TypeError, AttributeError) as e:
+                    # If cost parsing fails, log warning but continue with 0 cost
+                    # This is expected if OpenRouter doesn't include cost in the response format we're checking
+                    pass  # Silently continue with 0 cost
+                
+                return (result, usage)
             
         except Exception as e:
-            if attempt < max_retries - 1:
+            # Check if this is a recoverable error (429, 5xx, timeout, connection)
+            is_recoverable = False
+            error_str = str(e).lower()
+            if "429" in error_str or "rate limit" in error_str:
+                is_recoverable = True
+            elif "500" in error_str or "502" in error_str or "503" in error_str or "504" in error_str:
+                is_recoverable = True
+            elif "timeout" in error_str or "connection" in error_str:
+                is_recoverable = True
+            
+            if attempt < max_retries - 1 and is_recoverable:
                 delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
                 await asyncio.sleep(delay)
             else:
-                # Last attempt failed
-                return None
+                # Last attempt failed or non-recoverable error
+                if attempt == max_retries - 1:
+                    print(f"[RECIPE][AI] AI call failed after {max_retries} attempts: {str(e)}")
+                return (None, default_usage)
     
-    return None
+    return (None, default_usage)
 
 
 def _evaluate_ai_condition(condition: Optional[Dict[str, Any]], row: Dict[str, Any]) -> bool:
@@ -2723,17 +2783,22 @@ async def run_ai_task(
     errors: List[str],
     ai_client: AsyncOpenAI,
     semaphore: asyncio.Semaphore,
+    task_index: int,
+    task_name: str,
+    ai_run_stats: Dict[str, Any],
+    ai_task_stats: Dict[int, Dict[str, Any]],
+    ai_budget_exceeded: Dict[str, bool],
 ) -> None:
     """
     Execute an AI recipe task with optional conditional execution.
     
     This function:
     1. Validates sheet existence
-    2. For each row, checks idempotence (skip if output cell is non-empty)
-    3. For each row, evaluates condition if present (skips row if condition is false)
-    4. Builds prompts for eligible rows by substituting {ColumnName} placeholders
-    5. Calls AI API with batching, concurrency limits, and retries
-    6. Writes results to output column in output sheet
+    2. For each row, evaluates condition if present (skips row if condition is false)
+    3. Builds prompts for eligible rows by substituting {ColumnName} placeholders
+    4. Calls AI API with batching, concurrency limits, and retries
+    5. Writes results to output column in output sheet (ALWAYS overwrites if condition matches)
+    6. Tracks AI costs and tokens per task and per run
     
     Args:
         work: Dictionary mapping sheet names to their row lists (mutated)
@@ -2746,6 +2811,11 @@ async def run_ai_task(
         errors: List to append error messages to
         ai_client: AsyncOpenAI client instance
         semaphore: Semaphore to limit concurrent AI requests
+        task_index: Master sheet row index for this task
+        task_name: Name of the task (for logging/stats)
+        ai_run_stats: Dict to accumulate run-level stats (mutated)
+        ai_task_stats: Dict to store per-task stats (mutated)
+        ai_budget_exceeded: Dict with single key "exceeded" (bool) to track budget state (mutated)
     """
     # Validate sheet existence
     if input_sheet not in work:
@@ -2789,6 +2859,22 @@ async def run_ai_task(
     if len(input_rows) > 0:
         column_headers = set(input_rows[0].keys())
     
+    # Initialize task stats if not already present
+    if task_index not in ai_task_stats:
+        ai_task_stats[task_index] = {
+            "task_name": task_name,
+            "task_index": task_index,
+            "calls": 0,
+            "cost_credits": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0
+        }
+    
+    # Check if budget is already exceeded at task start
+    if ai_budget_exceeded.get("exceeded", False):
+        print(f"[RECIPE][AI] AI budget already exceeded; skipping AI task '{task_name}' (row {task_index})")
+        return
+    
     # Track statistics
     total_rows = len(input_rows)
     eligible_count = 0
@@ -2801,37 +2887,42 @@ async def run_ai_task(
         condition_info = f", condition present"
     print(f"[RECIPE][AI] Starting AI task: input_sheet='{input_sheet}', output_sheet='{output_sheet}', output_column='{output_column}', model='{model}', total_rows={total_rows}{condition_info}")
     
+    # Helper to check and update budget
+    def check_budget() -> bool:
+        """Check if budget is exceeded and update ai_budget_exceeded if so."""
+        cost_usd = ai_run_stats["total_cost_credits"] * AI_CREDITS_TO_USD
+        if cost_usd >= AI_RUN_BUDGET_USD:
+            ai_budget_exceeded["exceeded"] = True
+            return True
+        return False
+    
     # Build prompts for each row
     async def process_row(row_index: int, in_row: Dict[str, Any], out_row: Dict[str, Any]) -> None:
-        """Process a single row: check idempotence, check condition, build prompt, call AI, write result."""
+        """Process a single row: check condition, build prompt, call AI, write result, track costs."""
         nonlocal eligible_count, successful_count, failed_count
         
         try:
-            # 1. Check idempotence: if output cell is already non-empty, skip
-            out_raw = out_row.get(output_column, "")
-            out_str = str(out_raw).strip()
-            if out_str != "":
-                # Already filled, skip (idempotence)
-                print(f"[RECIPE][AI] Skipping row {row_index+2} in sheet '{output_sheet}' because output column '{output_column}' is already filled.")
+            # Check if budget exceeded before processing this row
+            if ai_budget_exceeded.get("exceeded", False):
                 return
             
-            # 2. Check condition: if condition is false, skip this row
+            # 1. Check condition: if condition is false, skip this row
             if not _evaluate_ai_condition(condition, in_row):
                 # Condition is false: skip this row, leave output cell unchanged
                 print(f"[RECIPE][AI] Skipping row {row_index+2} due to condition not met.")
                 return
             
-            # Row is eligible for processing
+            # Row is eligible for processing (condition matches - will overwrite existing output)
             eligible_count += 1
             
-            # 3. Build row values dict (column name -> value) from input row
+            # 2. Build row values dict (column name -> value) from input row
             variables = {}
             for col_name in column_headers:
                 value = in_row.get(col_name)
                 # Convert to string, handling None/empty
                 variables[col_name] = str(value) if value is not None else ""
             
-            # 4. Substitute placeholders in prompt template
+            # 3. Substitute placeholders in prompt template
             # Pattern: {ColumnName} where ColumnName matches a column header exactly
             # If a column is referenced but doesn't exist, substitute empty string
             prompt_text = prompt
@@ -2845,19 +2936,44 @@ async def run_ai_task(
                 value = variables.get(placeholder_name, "")
                 prompt_text = prompt_text.replace(f"{{{placeholder_name}}}", value)
             
-            # 5. Call AI with semaphore for concurrency control
+            # 4. Call AI with semaphore for concurrency control
             async with semaphore:
-                ai_response = await _call_ai_with_retry(ai_client, prompt_text, mapped_model)
+                # Check budget again right before making the call
+                if ai_budget_exceeded.get("exceeded", False):
+                    return
+                
+                ai_response, usage = await _call_ai_with_retry(ai_client, prompt_text, mapped_model)
             
-            # 6. Write result to output column
-            if ai_response is None:
+            # 5. Update stats and check budget
+            if ai_response is not None:
+                # Extract usage info
+                cost_credits = usage.get("cost_credits", 0.0)
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+                
+                # Update run-level stats
+                ai_run_stats["total_cost_credits"] += cost_credits
+                ai_run_stats["total_prompt_tokens"] += prompt_tokens
+                ai_run_stats["total_completion_tokens"] += completion_tokens
+                
+                # Update task-level stats
+                ai_task_stats[task_index]["calls"] += 1
+                ai_task_stats[task_index]["cost_credits"] += cost_credits
+                ai_task_stats[task_index]["prompt_tokens"] += prompt_tokens
+                ai_task_stats[task_index]["completion_tokens"] += completion_tokens
+                
+                # Check budget after updating stats
+                if check_budget():
+                    print(f"[RECIPE][AI] Budget exceeded after processing row {row_index+2}. Stopping further AI calls.")
+                
+                # 6. Write result to output column (ALWAYS overwrite if condition matched)
+                out_row[output_column] = ai_response
+                successful_count += 1
+            else:
                 # AI call failed: leave output cell unchanged (likely empty)
                 failed_count += 1
                 error_msg = f"[RECIPE][AI][ERROR] Row {row_index}: AI call failed"
                 print(error_msg)
-            else:
-                out_row[output_column] = ai_response
-                successful_count += 1
         except Exception as e:
             # Per-row error: leave output cell unchanged (likely empty)
             failed_count += 1
@@ -3126,6 +3242,14 @@ def run_recipe(project_id: str,
     """
     print(f"[RECIPE][RUN] initial work sheets: {list(work.keys())}")
     
+    # Initialize AI stats and budget tracking (even if no AI tasks, for consistent return structure)
+    ai_run_stats = {
+        "total_cost_credits": 0.0,
+        "total_prompt_tokens": 0,
+        "total_completion_tokens": 0
+    }
+    ai_task_stats = {}  # keyed by task_index (Master row index)
+    
     # Guard rail: If work dict is empty, this is a hard error
     if not work:
         error_msg = "[RECIPE] No sheets loaded into work dictionary. Spreadsheet appears to be empty."
@@ -3136,6 +3260,8 @@ def run_recipe(project_id: str,
             "urls_output": None,
             "contacts_output": None,
             "master_status_updates": None,
+            "ai_run_stats": ai_run_stats,
+            "ai_task_stats": [],
         }
     
     # Extract Master sheet for task parsing
@@ -3149,6 +3275,8 @@ def run_recipe(project_id: str,
             "urls_output": None,
             "contacts_output": None,
             "master_status_updates": None,
+            "ai_run_stats": ai_run_stats,
+            "ai_task_stats": [],
         }
     
     # Build inputs dictionary (read-only source for COPY_SHEET tasks)
@@ -3168,6 +3296,8 @@ def run_recipe(project_id: str,
             "urls_output": None,
             "contacts_output": None,
             "master_status_updates": None,
+            "ai_run_stats": ai_run_stats,
+            "ai_task_stats": [],
         }
     
     # Guard rail: Check if Master tab has zero runnable tasks
@@ -3180,6 +3310,8 @@ def run_recipe(project_id: str,
             "urls_output": None,
             "contacts_output": None,
             "master_status_updates": None,
+            "ai_run_stats": ai_run_stats,
+            "ai_task_stats": [],
         }
     
     # Validate that all sheets referenced by tasks exist in work dictionary
@@ -3200,6 +3332,8 @@ def run_recipe(project_id: str,
             "urls_output": None,
             "contacts_output": None,
             "master_status_updates": None,
+            "ai_run_stats": ai_run_stats,
+            "ai_task_stats": [],
         }
     
     # Execute tasks in order
@@ -3209,6 +3343,9 @@ def run_recipe(project_id: str,
     ai_client = None
     ai_semaphore = None
     has_ai_tasks = any(task.type == TASK_AI for task in tasks)
+    
+    # Initialize AI budget tracking
+    ai_budget_exceeded = {"exceeded": False}
     
     if has_ai_tasks:
         # Initialize OpenRouter client (same pattern as enrich_workflow)
@@ -3220,6 +3357,8 @@ def run_recipe(project_id: str,
                 "urls_output": None,
                 "contacts_output": None,
                 "master_status_updates": None,
+                "ai_run_stats": ai_run_stats,
+                "ai_task_stats": [],
             }
         
         ai_client = AsyncOpenAI(
@@ -3231,8 +3370,8 @@ def run_recipe(project_id: str,
             }
         )
         
-        # Create semaphore for concurrency control (5 concurrent requests, same as enrichment)
-        ai_semaphore = asyncio.Semaphore(5)
+        # Create semaphore for concurrency control (from env var, default 10)
+        ai_semaphore = asyncio.Semaphore(AI_MAX_CONCURRENT_PER_TASK)
     
     # Initialize Exa client and semaphore (only if we have Exa tasks)
     exa_client = None
@@ -3411,6 +3550,14 @@ def run_recipe(project_id: str,
                 # Note: asyncio.run() creates a new event loop, so this is safe even if
                 # called from a sync context (which is the case in worker.py)
                 try:
+                    # Get task name from Master sheet row (use "Task Name" column or fallback)
+                    task_name = f"AI task at row {task.row_index}"
+                    if task.row_index <= len(master_rows):
+                        master_row_idx = task.row_index - 2  # Convert to 0-based index (row 2 = index 0)
+                        if master_row_idx >= 0 and master_row_idx < len(master_rows):
+                            master_row = master_rows[master_row_idx]
+                            task_name = master_row.get("Task Name", task_name)
+                    
                     asyncio.run(run_ai_task(
                         work,
                         task.params["input_sheet"],
@@ -3422,6 +3569,11 @@ def run_recipe(project_id: str,
                         errors,
                         ai_client,
                         ai_semaphore,
+                        task.row_index,
+                        task_name,
+                        ai_run_stats,
+                        ai_task_stats,
+                        ai_budget_exceeded,
                     ))
                 except Exception as e:
                     error_msg = f"[RECIPE][AI][ERROR] AI task failed on row {task.row_index}: {str(e)}"
@@ -3475,6 +3627,8 @@ def run_recipe(project_id: str,
             "urls_output": None,
             "contacts_output": None,
             "master_status_updates": None,
+            "ai_run_stats": ai_run_stats,
+            "ai_task_stats": list(ai_task_stats.values()),
         }
     
     # Extract final results
@@ -3489,7 +3643,12 @@ def run_recipe(project_id: str,
             "urls_output": None,
             "contacts_output": None,
             "master_status_updates": None,
+            "ai_run_stats": ai_run_stats,
+            "ai_task_stats": list(ai_task_stats.values()),
         }
+    
+    # Convert ai_task_stats dict to list for return
+    ai_task_stats_list = list(ai_task_stats.values())
     
     return {
         "ok": True,
@@ -3497,5 +3656,7 @@ def run_recipe(project_id: str,
         "urls_output": urls_output_rows,
         "contacts_output": contacts_output_rows,
         "master_status_updates": master_status_updates,
+        "ai_run_stats": ai_run_stats,
+        "ai_task_stats": ai_task_stats_list,
     }
 

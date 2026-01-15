@@ -165,13 +165,16 @@ def write_rows_to_tab(service, sheet_id: str, tab_name: str, rows: List[Dict[str
 
 def update_master_statuses(service, sheet_id: str, tab_name: str, updates: List[Dict[str, Any]]) -> None:
     """
-    Update Status column values in the Master tab for specified rows.
+    Update Status and Cost column values in the Master tab for specified rows.
     
     Args:
         service: Google Sheets API service object
         sheet_id: Google Sheets spreadsheet ID
         tab_name: Name of the tab (typically "Master")
-        updates: List of dicts with 'row_index' (1-based) and 'status' keys
+        updates: List of dicts with:
+            - 'row_index' (1-based, required)
+            - 'status' (optional, string)
+            - 'cost_usd' (optional, float) - cost in USD for AI tasks
         
     Raises:
         Exception: If Sheets API operation fails
@@ -181,7 +184,7 @@ def update_master_statuses(service, sheet_id: str, tab_name: str, updates: List[
     
     sheets = service.spreadsheets()
     
-    # Read header row to find Status column
+    # Read header row to find Status and Cost columns
     header_range = f"{tab_name}!1:1"
     header_result = sheets.values().get(
         spreadsheetId=sheet_id,
@@ -225,26 +228,63 @@ def update_master_statuses(service, sheet_id: str, tab_name: str, updates: List[
             body={'values': [["Status"]]}
         ).execute()
     
-    status_col_letter = col_index_to_letter(status_col_index)
+    # Find Cost column index (0-based)
+    cost_col_index = None
+    for i, header in enumerate(headers):
+        if str(header).strip().lower() == "cost":
+            cost_col_index = i
+            break
     
-    # Update each row's Status cell
+    # If Cost column doesn't exist, append it
+    if cost_col_index is None:
+        # Append "Cost" to header row (after Status if Status was just added, or at end)
+        cost_col_index = len(headers) if status_col_index < len(headers) else len(headers)
+        # If Status was just added, Cost goes right after it
+        if status_col_index == len(headers) - 1:
+            cost_col_index = len(headers)
+        cost_col_letter = col_index_to_letter(cost_col_index)
+        sheets.values().update(
+            spreadsheetId=sheet_id,
+            range=f"{tab_name}!{cost_col_letter}1",
+            valueInputOption='RAW',
+            body={'values': [["Cost"]]}
+        ).execute()
+    
+    status_col_letter = col_index_to_letter(status_col_index)
+    cost_col_letter = col_index_to_letter(cost_col_index)
+    
+    # Update each row's Status and Cost cells
     for update in updates:
         row_index = update.get("row_index")
-        status = update.get("status", "")
         
         # Skip if row_index is missing or invalid (should be 1-based, >= 2 for data rows)
         if row_index is None or not isinstance(row_index, int) or row_index < 1:
             continue
         
-        # Build A1 notation (e.g., "C5" for column C, row 5)
-        cell_range = f"{tab_name}!{status_col_letter}{row_index}"
+        # Update Status if provided
+        if "status" in update:
+            status = update.get("status", "")
+            cell_range = f"{tab_name}!{status_col_letter}{row_index}"
+            sheets.values().update(
+                spreadsheetId=sheet_id,
+                range=cell_range,
+                valueInputOption='RAW',
+                body={'values': [[str(status)]]}
+            ).execute()
         
-        sheets.values().update(
-            spreadsheetId=sheet_id,
-            range=cell_range,
-            valueInputOption='RAW',
-            body={'values': [[str(status)]]}
-        ).execute()
+        # Update Cost if provided
+        if "cost_usd" in update:
+            cost_usd = update.get("cost_usd")
+            if cost_usd is not None:
+                # Round to 4 decimal places for display
+                cost_value = round(float(cost_usd), 4)
+                cell_range = f"{tab_name}!{cost_col_letter}{row_index}"
+                sheets.values().update(
+                    spreadsheetId=sheet_id,
+                    range=cell_range,
+                    valueInputOption='RAW',
+                    body={'values': [[cost_value]]}
+                ).execute()
 
 
 def export_results_to_google_sheets(project_id: str) -> None:
