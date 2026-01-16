@@ -747,21 +747,40 @@ def _parse_copy_columns(task_name: str) -> Optional[Dict[str, Any]]:
 def _parse_append_column(task_name: str) -> Optional[Dict[str, Any]]:
     """
     Parse 'Append column - (SourceSheet, SourceColumn, TargetSheet, TargetColumn)' pattern.
+    Also supports optional IF clause: 'Append column - (...) IF ConditionColumn contains "Text"'
     
-    Syntax example:
+    Syntax examples:
         Append column - (SourceSheet, SourceColumn, TargetSheet, TargetColumn)
+        Append column - (SourceSheet, SourceColumn, TargetSheet, TargetColumn) IF ConditionColumn contains "Text"
     
     Returns:
         Dict with 'source_sheet', 'source_column', 'target_sheet', and 'target_column' keys,
+        and optionally 'condition_column' and 'condition_value' if IF clause is present,
         or None if parse fails
     """
     # Check if task name starts with "Append column -" (case-insensitive)
     if not task_name.lower().startswith("append column -"):
         return None
     
+    # First, separate the optional IF clause
+    # Example:
+    #   "Append column - (URLs, Website, DNC URLs, Website) IF Status contains \"invalid\""
+    # or:
+    #   "Append column - (URLs, Website, DNC URLs, Website)"
+    task_part = task_name
+    condition_part = None
+    
+    upper_raw = task_name.upper()
+    if " IF " in upper_raw:
+        # Split on " IF " in a case-insensitive way while preserving original substrings
+        # Use the index from the uppercase string to slice the original
+        idx = upper_raw.index(" IF ")
+        task_part = task_name[:idx].strip()
+        condition_part = task_name[idx + 4:].strip()  # after "IF "
+    
     # Remove the prefix and trim
     prefix_len = len("Append column -")
-    rest = task_name[prefix_len:].strip()
+    rest = task_part[prefix_len:].strip()
     
     if not rest:
         return None
@@ -781,12 +800,41 @@ def _parse_append_column(task_name: str) -> Optional[Dict[str, Any]]:
     if not source_sheet or not source_column or not target_sheet or not target_column:
         return None
     
-    return {
+    task = {
         "source_sheet": source_sheet,
         "source_column": source_column,
         "target_sheet": target_sheet,
         "target_column": target_column
     }
+    
+    # If there is an IF clause, parse: ConditionColumn contains "Text"
+    if condition_part:
+        # We expect something like: Status contains "invalid"
+        # Make "contains" check case-insensitive on the keyword only.
+        cond_upper = condition_part.upper()
+        keyword = " CONTAINS "
+        if keyword not in cond_upper:
+            # Invalid condition syntax
+            return None
+        
+        idx_contains = cond_upper.index(keyword)
+        column_part = condition_part[:idx_contains].strip()
+        value_part = condition_part[idx_contains + len(keyword):].strip()
+        
+        # column_part is the condition column name
+        condition_column = column_part
+        
+        # value_part should be something like: "invalid" (with quotes)
+        if value_part.startswith("\"") and value_part.endswith("\"") and len(value_part) >= 2:
+            condition_value = value_part[1:-1]
+        else:
+            # If quotes are missing, still accept and use the raw string
+            condition_value = value_part
+        
+        task["condition_column"] = condition_column
+        task["condition_value"] = condition_value
+    
+    return task
 
 
 def _parse_exa_condition(condition_segment: str) -> Optional[Dict[str, str]]:
@@ -2716,7 +2764,9 @@ def append_column(work: Dict[str, List[Dict[str, Any]]],
                   source_column: str,
                   target_sheet: str,
                   target_column: str,
-                  errors: List[str]) -> None:
+                  errors: List[str],
+                  condition_column: Optional[str] = None,
+                  condition_value: Optional[str] = None) -> None:
     """
     Append all non-blank values from SourceColumn onto end of TargetColumn.
     
@@ -2724,6 +2774,8 @@ def append_column(work: Dict[str, List[Dict[str, Any]]],
     - Appends the value as a new row in target_sheet with only target_column set
     - Skips blank/empty values
     - Protects against missing sheets and missing columns
+    - If condition_column and condition_value are provided, only appends rows where
+      condition_column contains condition_value (case-insensitive)
     
     Args:
         work: Dictionary mapping sheet names to their row lists (mutated)
@@ -2732,9 +2784,13 @@ def append_column(work: Dict[str, List[Dict[str, Any]]],
         target_sheet: Name of target sheet in work
         target_column: Name of target column to append to
         errors: List to append error messages to (mutated)
+        condition_column: Optional column name on source sheet to check condition against
+        condition_value: Optional string value to check for in condition_column (case-insensitive substring match)
     """
     print(f"[RECIPE][APPEND_COLUMN] Source sheet: {source_sheet}, Source column: {source_column}")
     print(f"[RECIPE][APPEND_COLUMN] Target sheet: {target_sheet}, Target column: {target_column}")
+    if condition_column and condition_value:
+        print(f"[RECIPE][APPEND_COLUMN] Condition: {condition_column} contains \"{condition_value}\"")
     
     # Validate sheets exist
     if source_sheet not in work:
@@ -2756,17 +2812,28 @@ def append_column(work: Dict[str, List[Dict[str, Any]]],
     for row in source_rows:
         if source_column not in row:
             row[source_column] = ""
+        if condition_column and condition_column not in row:
+            row[condition_column] = ""
     
     for row in target_rows:
         if target_column not in row:
             row[target_column] = ""
     
-    # Collect non-blank values
+    # Collect non-blank values, applying condition if present
     new_values = []
     for row in source_rows:
         val = row.get(source_column, "").strip()
-        if val:
-            new_values.append(val)
+        if not val:
+            continue  # Skip blank values
+        
+        # If condition is specified, check it
+        if condition_column and condition_value:
+            condition_col_val = str(row.get(condition_column, "")).lower()
+            condition_check_val = condition_value.lower()
+            if condition_check_val not in condition_col_val:
+                continue  # Condition not met, skip this row
+        
+        new_values.append(val)
     
     print(f"[RECIPE][APPEND_COLUMN] Found {len(new_values)} non-blank values to append")
     
@@ -3775,7 +3842,9 @@ def run_recipe(project_id: str,
                     task.params["source_column"],
                     task.params["target_sheet"],
                     task.params["target_column"],
-                    errors
+                    errors,
+                    condition_column=task.params.get("condition_column"),
+                    condition_value=task.params.get("condition_value")
                 )
             elif task.type == TASK_AI:
                 # AI tasks are async, so we need to run them in an event loop
