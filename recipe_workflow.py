@@ -52,6 +52,7 @@ TASK_AI = "AI"
 TASK_EXA = "EXA"
 TASK_COUNT_MATCHES = "COUNT_MATCHES"
 TASK_LOWERCASE_COLUMN = "LOWERCASE_COLUMN"
+TASK_CLEAR_SHEET = "CLEAR_SHEET"
 
 # Input sheet names (read-only)
 INPUT_SHEETS = {"URLs", "Contacts", "Master"}
@@ -174,6 +175,30 @@ def _parse_deduplicate(task_name: str) -> Optional[Dict[str, Any]]:
     column = match.group(2).strip()
     
     return {"sheet": sheet, "column": column}
+
+
+def _parse_clear_sheet(task_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse 'Clear sheet - (SheetName)' pattern.
+    
+    Returns:
+        Dict with 'sheet' key, or None if parse fails
+    """
+    task_lower = task_name.lower()
+    if not task_lower.startswith("clear sheet -"):
+        return None
+    
+    # Find the position after "clear sheet -" (case-insensitive)
+    prefix_len = len("clear sheet -")
+    inner = task_name[prefix_len:].strip()
+    if inner.startswith("(") and inner.endswith(")"):
+        inner = inner[1:-1]
+    
+    sheet_name = inner.strip()
+    if not sheet_name:
+        return None
+    
+    return {"sheet": sheet_name}
 
 
 def _parse_normalize_urls(task_name: str) -> Optional[Dict[str, Any]]:
@@ -1147,7 +1172,8 @@ def _validate_task(task_type: str, params: Dict[str, Any], row_index: int) -> Op
             return f"Row {row_index}: Copy sheet target is required"
     
     elif task_type in (TASK_DEDUPLICATE, TASK_NORMALIZE_URLS, TASK_LOWERCASE_COLUMN, TASK_FILTER_INCLUDE, 
-                       TASK_FILTER_EXCLUDE, TASK_FILTER_BLANK, TASK_COUNT_BY, TASK_SORT, TASK_REMOVE_CHARACTERS):
+                       TASK_FILTER_EXCLUDE, TASK_FILTER_BLANK, TASK_COUNT_BY, TASK_SORT, TASK_REMOVE_CHARACTERS,
+                       TASK_CLEAR_SHEET):
         sheet = params.get("sheet")
         
         # Validate that all required fields are non-empty
@@ -1398,6 +1424,11 @@ def parse_master_tasks(master_rows: List[Dict[str, Any]], *, data_row_start: int
             if parsed:
                 task_type = TASK_COPY_SHEET
                 params = parsed
+        elif task_name.lower().startswith("clear sheet"):
+            parsed = _parse_clear_sheet(task_name)
+            if parsed:
+                task_type = TASK_CLEAR_SHEET
+                params = parsed
         elif task_name.lower().startswith("deduplicate"):
             parsed = _parse_deduplicate(task_name)
             if parsed:
@@ -1549,6 +1580,9 @@ def _extract_referenced_sheets(tasks: List[RecipeTask]) -> set:
         if task.type == TASK_COPY_SHEET:
             # Only source is required to exist; target can be created
             referenced_sheets.add(params.get("source"))
+        elif task.type == TASK_CLEAR_SHEET:
+            # Sheet must exist to be cleared
+            referenced_sheets.add(params.get("sheet"))
         elif task.type == TASK_DEDUPLICATE:
             referenced_sheets.add(params.get("sheet"))
         elif task.type == TASK_NORMALIZE_URLS:
@@ -1668,6 +1702,19 @@ def deduplicate(work: Dict[str, List[Dict[str, Any]]],
             unique_rows.append(row)
     
     work[sheet] = unique_rows
+
+
+def clear_sheet(work: Dict[str, List[Dict[str, Any]]],
+                sheet: str) -> None:
+    """
+    Clear all rows from a sheet without deleting the sheet itself.
+    
+    Args:
+        work: Dictionary mapping sheet names to their row lists (mutated)
+        sheet: Name of sheet in work to clear
+    """
+    # Set the sheet to an empty list (creates it if it doesn't exist)
+    work[sheet] = []
 
 
 def normalize_urls(work: Dict[str, List[Dict[str, Any]]],
@@ -3685,6 +3732,11 @@ def run_recipe(project_id: str,
                     work,
                     task.params["source"],
                     task.params["target"]
+                )
+            elif task.type == TASK_CLEAR_SHEET:
+                clear_sheet(
+                    work,
+                    task.params["sheet"]
                 )
             elif task.type == TASK_DEDUPLICATE:
                 deduplicate(
