@@ -24,6 +24,7 @@ from sheet_export import (
     write_rows_to_tab,
     update_master_statuses
 )
+from services.snapshot_ingest import ingest_spreadsheet_to_supabase
 
 # Load environment variables
 load_dotenv()
@@ -31,6 +32,9 @@ load_dotenv()
 # Supabase configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# Snapshot ingestion feature flag
+SNAPSHOT_INGEST_ENABLED = os.getenv("SNAPSHOT_INGEST_ENABLED", "false").lower() == "true"
 
 
 def log(message: str) -> None:
@@ -212,6 +216,45 @@ def process_run(run_row, supabase):
                 raise ValueError(f"Invalid project_id (sheet_id): {project_id}")
             
             log(f"[worker] [RECIPE] Using sheet_id={sheet_id} (from project_id, not prompts table)")
+            
+            # Snapshot ingestion phase (if enabled)
+            if SNAPSHOT_INGEST_ENABLED:
+                log(f"[worker] [SNAPSHOT] Snapshot ingestion enabled, starting ingestion phase")
+                
+                # Check if run is still active before ingestion
+                if not is_run_active(supabase, run_id):
+                    log(f"Run {run_id} is no longer active, stopping before ingestion")
+                    return
+                
+                try:
+                    # Define callback to check if run is still active
+                    def is_run_active_callback() -> bool:
+                        return is_run_active(supabase, run_id)
+                    
+                    # Perform snapshot ingestion
+                    ingest_spreadsheet_to_supabase(
+                        project_id=project_id,
+                        run_id=run_id,
+                        sheets_service=service,
+                        supabase=supabase,
+                        is_run_active_callback=is_run_active_callback
+                    )
+                    
+                    log(f"[worker] [SNAPSHOT] Snapshot ingestion completed successfully")
+                    
+                except Exception as ingest_error:
+                    # Ingestion failed - error already logged and run marked as failed by ingest function
+                    log(f"[worker] [SNAPSHOT] Snapshot ingestion failed: {str(ingest_error)}")
+                    # The ingest function should have already marked the run as failed
+                    # Just return here to stop processing
+                    return
+                
+                # Check if run is still active after ingestion
+                if not is_run_active(supabase, run_id):
+                    log(f"Run {run_id} is no longer active, stopping after ingestion")
+                    return
+            else:
+                log(f"[worker] [SNAPSHOT] Snapshot ingestion disabled (SNAPSHOT_INGEST_ENABLED=false)")
             
             # Get list of all sheets (tabs) in the spreadsheet
             try:
