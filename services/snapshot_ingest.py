@@ -292,7 +292,8 @@ def ingest_spreadsheet_to_supabase(
     run_id: int,
     sheets_service,
     supabase: Client,
-    is_run_active_callback: Callable[[], bool]
+    is_run_active_callback: Callable[[], bool],
+    heartbeat_callback: Optional[Callable[[], None]] = None
 ) -> None:
     """
     Ingest all sheet tabs from a Google Spreadsheet into Supabase snapshot tables.
@@ -313,6 +314,7 @@ def ingest_spreadsheet_to_supabase(
         sheets_service: Google Sheets API service object
         supabase: Supabase client instance
         is_run_active_callback: Callable that returns True if run is still active
+        heartbeat_callback: Optional callable to invoke for lock heartbeat (called once per batch)
         
     Raises:
         Exception: If ingestion fails (run will be marked as failed)
@@ -547,6 +549,16 @@ def ingest_spreadsheet_to_supabase(
                     supabase, run_id,
                     ingested_rows_done=total_rows_ingested
                 )
+                
+                # Call lock heartbeat callback if provided (once per batch)
+                if heartbeat_callback:
+                    try:
+                        heartbeat_callback()
+                    except Exception as e:
+                        log(f"  ERROR: Lock heartbeat callback failed: {str(e)}")
+                        # If heartbeat fails, abort ingestion
+                        raise Exception(f"Lock heartbeat failed during ingestion: {str(e)}")
+                
                 # Update heartbeat after batch if 15 seconds have passed
                 current_time = time.time()
                 if current_time - last_heartbeat_time >= 15.0:
