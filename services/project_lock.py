@@ -46,10 +46,10 @@ def acquire_lock(
         response = supabase.rpc(
             "acquire_project_lock",
             {
-                "project_id": project_id,
-                "run_id": run_id,
-                "worker_id": worker_id,
-                "ttl_seconds": ttl_seconds
+                "p_project_id": project_id,
+                "p_run_id": run_id,
+                "p_worker_id": worker_id,
+                "p_ttl_seconds": ttl_seconds
             }
         ).execute()
         
@@ -113,10 +113,10 @@ def heartbeat_lock(
         response = supabase.rpc(
             "heartbeat_project_lock",
             {
-                "project_id": project_id,
-                "run_id": run_id,
-                "worker_id": worker_id,
-                "ttl_seconds": ttl_seconds
+                "p_project_id": project_id,
+                "p_run_id": run_id,
+                "p_worker_id": worker_id,
+                "p_ttl_seconds": ttl_seconds
             }
         ).execute()
         
@@ -175,9 +175,9 @@ def release_lock(
         response = supabase.rpc(
             "release_project_lock",
             {
-                "project_id": project_id,
-                "run_id": run_id,
-                "worker_id": worker_id
+                "p_project_id": project_id,
+                "p_run_id": run_id,
+                "p_worker_id": worker_id
             }
         ).execute()
         
