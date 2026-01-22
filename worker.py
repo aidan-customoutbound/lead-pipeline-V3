@@ -26,6 +26,7 @@ from sheet_export import (
     update_master_statuses
 )
 from services.snapshot_ingest import ingest_spreadsheet_to_supabase
+from services.snapshot_read import load_work_from_snapshot
 from services.project_lock import acquire_lock, heartbeat_lock, release_lock
 
 # Load environment variables
@@ -37,6 +38,12 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # Snapshot ingestion feature flag
 SNAPSHOT_INGEST_ENABLED = os.getenv("SNAPSHOT_INGEST_ENABLED", "false").lower() == "true"
+
+# Snapshot read feature flag
+SNAPSHOT_READ_ENABLED = os.getenv("SNAPSHOT_READ_ENABLED", "false").lower() == "true"
+
+# Snapshot read page size
+SNAPSHOT_READ_PAGE_ROWS = int(os.getenv("SNAPSHOT_READ_PAGE_ROWS", "10000"))
 
 # Lock configuration
 RUN_LOCK_TTL_SECONDS = int(os.getenv("RUN_LOCK_TTL_SECONDS", "900"))
@@ -336,36 +343,85 @@ def process_run(run_row, supabase):
                     else:
                         log(f"[worker] [SNAPSHOT] Snapshot ingestion disabled (SNAPSHOT_INGEST_ENABLED=false)")
                     
-                    # Get list of all sheets (tabs) in the spreadsheet
-                    try:
-                        spreadsheet_metadata = service.spreadsheets().get(
-                            spreadsheetId=sheet_id,
-                            includeGridData=False
-                        ).execute()
+                    # Load work dictionary from snapshot or Google Sheets
+                    if SNAPSHOT_INGEST_ENABLED and SNAPSHOT_READ_ENABLED:
+                        # Load from Supabase snapshot
+                        log(f"[worker] [SNAPSHOT_READ] Loading work from snapshot: project_id={project_id}, run_id={run_id}")
                         
-                        sheets_list = spreadsheet_metadata.get('sheets', [])
-                        tab_titles = [sheet['properties']['title'] for sheet in sheets_list]
-                        log(f"[worker] [RECIPE] Found {len(tab_titles)} tabs in spreadsheet: {', '.join(tab_titles)}")
-                    except Exception as e:
-                        raise ValueError(f"[RECIPE] Failed to get spreadsheet metadata for sheet_id={sheet_id}: {str(e)}")
-                    
-                    # Load ALL tabs into work dictionary
-                    work: Dict[str, List[Dict[str, Any]]] = {}
-                    for tab_title in tab_titles:
-                        rows = read_tab_as_rows(service, sheet_id, tab_title)
-                        work[tab_title] = rows
-                        log(f"[worker] [RECIPE] Loaded tab '{tab_title}': {len(rows)} rows")
-                    
-                    # Guard rail: Check if Master tab is missing or empty
-                    master_rows = work.get("Master", [])
-                    if not master_rows or len(master_rows) == 0:
-                        raise ValueError(f"[RECIPE] Master tab is missing or empty in sheet {sheet_id}. Cannot run recipe without task definitions.")
-                    
-                    # Guard rail: Check if we have at least some data in one tab (excluding Master)
-                    # This prevents silently running with empty work dict
-                    non_master_rows = sum(len(rows) for tab_name, rows in work.items() if tab_name != "Master")
-                    if non_master_rows == 0:
-                        raise ValueError(f"[RECIPE] No data found in any tabs (excluding Master) in sheet {sheet_id}. Cannot run recipe with empty work dictionary.")
+                        try:
+                            work = load_work_from_snapshot(
+                                supabase=supabase,
+                                project_id=project_id,
+                                run_id=run_id,
+                                page_rows=SNAPSHOT_READ_PAGE_ROWS
+                            )
+                            
+                            # Guard rail: Check if Master tab is missing or empty
+                            master_rows = work.get("Master", [])
+                            if not master_rows or len(master_rows) == 0:
+                                error_msg = f"[RECIPE] Master tab is missing or empty in snapshot for run_id={run_id}. Cannot run recipe without task definitions."
+                                log(f"ERROR: {error_msg}")
+                                raise ValueError(error_msg)
+                            
+                            # Guard rail: Check if we have at least some data in one tab (excluding Master)
+                            non_master_rows = sum(len(rows) for tab_name, rows in work.items() if tab_name != "Master")
+                            if non_master_rows == 0:
+                                error_msg = f"[RECIPE] No data found in any tabs (excluding Master) in snapshot for run_id={run_id}. Cannot run recipe with empty work dictionary."
+                                log(f"ERROR: {error_msg}")
+                                raise ValueError(error_msg)
+                            
+                            log(f"[worker] [SNAPSHOT_READ] Successfully loaded work from snapshot: {len(work)} sheets")
+                            
+                        except Exception as snapshot_error:
+                            # Snapshot read failed - mark run as failed
+                            error_msg = f"Failed to load work from snapshot: {str(snapshot_error)}"
+                            log(f"ERROR: {error_msg}")
+                            
+                            finished_at = datetime.utcnow()
+                            try:
+                                supabase.table("runs").update({
+                                    "status": "failed",
+                                    "finished_at": finished_at.isoformat(),
+                                    "error_message": error_msg[:500]
+                                }).eq("id", run_id).eq("status", "running").execute()
+                            except Exception as update_error:
+                                log(f"Error updating run {run_id} to failed: {str(update_error)}")
+                            
+                            return
+                    else:
+                        # Load from Google Sheets (existing path)
+                        log(f"[worker] [RECIPE] Loading work from Google Sheets (snapshot read disabled)")
+                        
+                        # Get list of all sheets (tabs) in the spreadsheet
+                        try:
+                            spreadsheet_metadata = service.spreadsheets().get(
+                                spreadsheetId=sheet_id,
+                                includeGridData=False
+                            ).execute()
+                            
+                            sheets_list = spreadsheet_metadata.get('sheets', [])
+                            tab_titles = [sheet['properties']['title'] for sheet in sheets_list]
+                            log(f"[worker] [RECIPE] Found {len(tab_titles)} tabs in spreadsheet: {', '.join(tab_titles)}")
+                        except Exception as e:
+                            raise ValueError(f"[RECIPE] Failed to get spreadsheet metadata for sheet_id={sheet_id}: {str(e)}")
+                        
+                        # Load ALL tabs into work dictionary
+                        work: Dict[str, List[Dict[str, Any]]] = {}
+                        for tab_title in tab_titles:
+                            rows = read_tab_as_rows(service, sheet_id, tab_title)
+                            work[tab_title] = rows
+                            log(f"[worker] [RECIPE] Loaded tab '{tab_title}': {len(rows)} rows")
+                        
+                        # Guard rail: Check if Master tab is missing or empty
+                        master_rows = work.get("Master", [])
+                        if not master_rows or len(master_rows) == 0:
+                            raise ValueError(f"[RECIPE] Master tab is missing or empty in sheet {sheet_id}. Cannot run recipe without task definitions.")
+                        
+                        # Guard rail: Check if we have at least some data in one tab (excluding Master)
+                        # This prevents silently running with empty work dict
+                        non_master_rows = sum(len(rows) for tab_name, rows in work.items() if tab_name != "Master")
+                        if non_master_rows == 0:
+                            raise ValueError(f"[RECIPE] No data found in any tabs (excluding Master) in sheet {sheet_id}. Cannot run recipe with empty work dictionary.")
                     
                     # Check if run is still active before running recipe
                     if not is_run_active(supabase, run_id):
