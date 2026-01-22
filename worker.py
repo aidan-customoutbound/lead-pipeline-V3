@@ -264,7 +264,7 @@ def process_run(run_row, supabase):
                 # Get Google Sheets service
                 service = get_sheets_service()
                 if not service:
-                    raise ValueError("Could not create Google Sheets service. Check GOOGLE_SA_JSON environment variable.")
+                    raise ValueError("Could not create Google Sheets service. Check GOOGLE_SA_JSON_FILE or GOOGLE_SA_JSON environment variables.")
                 
                 # For recipe runs, project_id IS the Google Sheet ID
                 # Do NOT use get_sheet_id_for_project or read from prompts table

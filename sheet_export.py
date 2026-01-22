@@ -18,7 +18,50 @@ load_dotenv()
 # Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
+
+
+def load_google_service_account_credentials() -> Dict[str, Any]:
+    """
+    Load Google service account credentials from environment variables.
+    
+    Supports two methods (in order of preference):
+    1. GOOGLE_SA_JSON_FILE - file path containing the service account JSON
+    2. GOOGLE_SA_JSON - raw JSON string
+    
+    Returns:
+        Dictionary containing service account credentials
+        
+    Raises:
+        ValueError: If neither environment variable is set or credentials cannot be loaded
+    """
+    # Try GOOGLE_SA_JSON_FILE first (preferred)
+    json_file_path = os.getenv("GOOGLE_SA_JSON_FILE")
+    if json_file_path:
+        if os.path.exists(json_file_path):
+            try:
+                with open(json_file_path, 'r', encoding='utf-8') as f:
+                    credentials = json.load(f)
+                print(f"  [SHEET EXPORT] Using Google service account credentials from FILE: {json_file_path}")
+                return credentials
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON in GOOGLE_SA_JSON_FILE ({json_file_path}): {str(e)}")
+            except Exception as e:
+                raise ValueError(f"Error reading GOOGLE_SA_JSON_FILE ({json_file_path}): {str(e)}")
+        else:
+            raise ValueError(f"GOOGLE_SA_JSON_FILE specified but file does not exist: {json_file_path}")
+    
+    # Fall back to GOOGLE_SA_JSON
+    json_string = os.getenv("GOOGLE_SA_JSON")
+    if json_string:
+        try:
+            credentials = json.loads(json_string)
+            print("  [SHEET EXPORT] Using Google service account credentials from ENV (GOOGLE_SA_JSON)")
+            return credentials
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in GOOGLE_SA_JSON: {str(e)}")
+    
+    # Neither is set
+    raise ValueError("Could not create Google Sheets service. Check GOOGLE_SA_JSON_FILE or GOOGLE_SA_JSON environment variables.")
 
 
 def get_sheets_service():
@@ -28,18 +71,18 @@ def get_sheets_service():
     Returns:
         Google Sheets API service object, or None if configuration is missing/invalid
     """
-    if not GOOGLE_SA_JSON:
-        print("  [SHEET EXPORT] GOOGLE_SA_JSON not set, cannot create Sheets service")
-        return None
-    
     try:
-        sa_credentials = json.loads(GOOGLE_SA_JSON)
+        sa_credentials = load_google_service_account_credentials()
         credentials = service_account.Credentials.from_service_account_info(
             sa_credentials,
             scopes=['https://www.googleapis.com/auth/spreadsheets']
         )
         service = build('sheets', 'v4', credentials=credentials)
         return service
+    except ValueError as e:
+        # ValueError from load_google_service_account_credentials has clear error message
+        print(f"  [SHEET EXPORT] {str(e)}")
+        return None
     except Exception as e:
         print(f"  [SHEET EXPORT] Error creating Sheets service: {str(e)}")
         return None
@@ -293,7 +336,7 @@ def export_results_to_google_sheets(project_id: str) -> None:
     
     Steps:
     1. Use project_id as sheet_id (for recipe runs, project_id is the sheet ID)
-    2. Read GOOGLE_SA_JSON from env and build a Sheets API client
+    2. Load Google service account credentials and build a Sheets API client
     3. Query Supabase: SELECT * FROM prospects WHERE project_id=<id> ORDER BY id ASC
     4. Build a 2D list with first row = column names, following rows = values
     5. Clear the 'output' tab fully using spreadsheets.values.clear()
