@@ -48,8 +48,8 @@ def acquire_lock(
             {
                 "p_project_id": project_id,
                 "p_run_id": run_id,
-                "p_worker_id": worker_id,
-                "p_ttl_seconds": ttl_seconds
+                "p_ttl_seconds": ttl_seconds,
+                "p_worker_id": worker_id
             }
         ).execute()
         
@@ -115,8 +115,8 @@ def heartbeat_lock(
             {
                 "p_project_id": project_id,
                 "p_run_id": run_id,
-                "p_worker_id": worker_id,
-                "p_ttl_seconds": ttl_seconds
+                "p_ttl_seconds": ttl_seconds,
+                "p_worker_id": worker_id
             }
         ).execute()
         
