@@ -15,13 +15,14 @@ from datetime import datetime
 from typing import Dict, Any, List
 
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
 # Import the run functions from our modules
 import upload_csv
+from services.xlsx_ingest import ingest_project_file
 
 # Load environment variables
 load_dotenv()
@@ -401,6 +402,63 @@ async def stop_endpoint(request: Request) -> JSONResponse:
         raise
     except Exception as e:
         logger.error(f"Error in /stop endpoint: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+
+@app.post("/upload_xlsx")
+async def upload_xlsx_endpoint(
+    file: UploadFile = File(...),
+    project_id: str = Form(...)
+) -> JSONResponse:
+    """
+    Upload XLSX file to Supabase run_sheet_rows table.
+    
+    Args:
+        file: Excel file (XLSX format)
+        project_id: Project ID to scope all operations
+        
+    Returns:
+        JSON response with summary dict containing tabs and rows count
+    """
+    try:
+        # Log request
+        timestamp = datetime.utcnow().isoformat()
+        logger.info(f"[{timestamp}] POST /upload_xlsx - project_id={project_id}, filename={file.filename}")
+        
+        # Validate required fields
+        if not project_id or not project_id.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Missing or empty required field: project_id"
+            )
+        
+        # Read file bytes
+        file_bytes = await file.read()
+        
+        if not file_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="File is empty"
+            )
+        
+        # Get Supabase client
+        supabase = get_supabase_client()
+        
+        # Ingest the file
+        result = ingest_project_file(project_id, file_bytes, supabase)
+        
+        logger.info(f"[{timestamp}] POST /upload_xlsx - SUCCESS - project_id={project_id}, tabs={len(result.get('tabs', []))}, rows={result.get('rows', 0)}")
+        
+        return JSONResponse(content=result)
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Error in /upload_xlsx endpoint: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Internal server error: {str(e)}"
